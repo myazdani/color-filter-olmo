@@ -10,6 +10,14 @@ restore_dataloader: false # restart from step 0
 reset_optimizer_state: true
 reset_trainer_state: true
 seed: 1
+uncertainty_scoring:
+  enabled: false
+  num_samples: 10
+  perturbation_type: dropout
+  selection_metric: lcb
+  lcb_alpha: 1.0
+  coupled_masks: true
+  activation_noise_std: 0.01
 sweep:
   - load_path:
       - prior

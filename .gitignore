@@ -49,6 +49,7 @@ __pycache__
 # documentation build artifacts
 
 docs/build
+notes/
 site/
 
 # runs

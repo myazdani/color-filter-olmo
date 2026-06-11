@@ -1,19 +1,61 @@
 import numpy as np
 import os
 import sys
+from typing import Dict, List
 
+import torch
+
+from olmo.color_uncertainty import COLOR_UNCERTAINTY_METRICS, summarize_color_samples
 from olmo.config import TrainConfig
 from olmo.registry import SCORE_DICT
 from olmo.util import clean_opt, prepare_cli_environment
 
 
 # Data path should be a string of the form: prior1+prior2,cond1+cond2
+FILE_SEQS = 1048576
+SCORE_DTYPE = np.float32
 
 
 def remove_trailing_zeros(arr):
     non_zero_indices = np.nonzero(arr)[0]
+    if len(non_zero_indices) == 0:
+        return arr[:0]
     last_non_zero_index = non_zero_indices[-1]
     return arr[: last_non_zero_index + 1]
+
+
+def infer_score_width(path: str, file_seqs: int = FILE_SEQS, dtype=SCORE_DTYPE) -> int:
+    n_values = os.path.getsize(path) // np.dtype(dtype).itemsize
+    if n_values % file_seqs != 0:
+        raise ValueError(f"Could not infer score width for {path}")
+    return n_values // file_seqs
+
+
+def load_score_chunk(path: str, rows: int, width: int) -> np.ndarray:
+    scores = np.memmap(path, dtype=SCORE_DTYPE, mode="r", shape=(FILE_SEQS, width))
+    return np.array(scores[:rows])
+
+
+def summarize_score_chunk(
+    prior_scores: np.ndarray,
+    conditional_scores: np.ndarray,
+    cfg: TrainConfig,
+) -> Dict[str, np.ndarray]:
+    num_samples = cfg.uncertainty_scoring.num_samples
+    if prior_scores.shape[1] < num_samples or conditional_scores.shape[1] < num_samples:
+        raise ValueError(
+            "uncertainty_scoring.num_samples is larger than the score width "
+            f"({prior_scores.shape[1]} prior, {conditional_scores.shape[1]} conditional)"
+        )
+
+    prior_losses = torch.from_numpy(prior_scores[:, :num_samples].T)
+    conditional_losses = torch.from_numpy(conditional_scores[:, :num_samples].T)
+    summary = summarize_color_samples(
+        prior_losses,
+        conditional_losses,
+        alpha=cfg.uncertainty_scoring.lcb_alpha,
+    )
+    return {metric: values.numpy() for metric, values in summary.items()}
 
 
 def main(cfg: TrainConfig):
@@ -23,13 +65,21 @@ def main(cfg: TrainConfig):
 
     prior_paths = [SCORE_DICT.get(path, path) for path in prior_paths]
     cond_paths = [SCORE_DICT.get(path, path) for path in cond_paths]
+    if cfg.uncertainty_scoring.enabled and cfg.uncertainty_scoring.selection_metric not in COLOR_UNCERTAINTY_METRICS:
+        raise ValueError(
+            "uncertainty_scoring.selection_metric must be one of "
+            f"{', '.join(COLOR_UNCERTAINTY_METRICS)}"
+        )
 
-    scores = []
-    indices = []
+    scores: List[np.ndarray] = []
+    indices: List[np.ndarray] = []
+    uncertainty_metrics: Dict[str, List[np.ndarray]] = {metric: [] for metric in COLOR_UNCERTAINTY_METRICS}
     for prior_path, cond_path in zip(prior_paths, cond_paths):
         print(f"prior path: {prior_path}")
         print(f"cond path: {cond_path}")
         print(f"Tau: {cfg.tau}")
+        if cfg.uncertainty_scoring.enabled:
+            print(f"Uncertainty selection metric: {cfg.uncertainty_scoring.selection_metric}")
 
         with open(cond_path + "/files.txt", "r") as f:
             cond_files = f.readlines()
@@ -53,12 +103,20 @@ def main(cfg: TrainConfig):
             print(cond_file.split("/")[-1].strip(), prior_file.split("/")[-1].strip())
             cond_file = cond_file.strip()
             prior_file = prior_file.strip()
-            conds = np.memmap(cond_file, dtype=np.float32, mode="r", shape=(1048576, 1))
-            priors = np.memmap(prior_file, dtype=np.float32, mode="r", shape=(1048576, 1))
-            if idx_len - score_len < 1048576:
-                conds = conds[: idx_len - score_len]
-                priors = priors[: idx_len - score_len]
-            score = priors.mean(axis=-1) - conds.mean(axis=-1)
+            cond_width = infer_score_width(cond_file)
+            prior_width = infer_score_width(prior_file)
+            rows = min(FILE_SEQS, idx_len - score_len)
+            if rows <= 0:
+                break
+            conds = load_score_chunk(cond_file, rows, cond_width)
+            priors = load_score_chunk(prior_file, rows, prior_width)
+            if cfg.uncertainty_scoring.enabled:
+                chunk_metrics = summarize_score_chunk(priors, conds, cfg)
+                for metric, values in chunk_metrics.items():
+                    uncertainty_metrics[metric].append(values)
+                score = chunk_metrics[cfg.uncertainty_scoring.selection_metric]
+            else:
+                score = priors.mean(axis=-1) - conds.mean(axis=-1)
             scores.append(score)
             score_len += len(score)
 
@@ -93,6 +151,15 @@ def main(cfg: TrainConfig):
         save_scores = np.memmap(save_path, dtype=np.float32, mode="w+", shape=(len(scores),))
         save_scores[:] = scores[sorted_score_idx].astype(np.float32)
         save_scores.flush()
+
+    if cfg.uncertainty_scoring.enabled:
+        save_path = os.path.join(cfg.save_folder, "uncertainty_metrics.npz")
+        print(f"Saving uncertainty metrics to {save_path}")
+        np.savez(
+            save_path,
+            index=indices.astype(np.uint32),
+            **{metric: np.concatenate(values).astype(np.float32) for metric, values in uncertainty_metrics.items()},
+        )
 
 
 if __name__ == "__main__":

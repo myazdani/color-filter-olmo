@@ -52,6 +52,7 @@ __all__ = [
     "FSDPWrapStrategy",
     "FSDPConfig",
     "CheckpointType",
+    "UncertaintyScoringConfig",
 ]
 
 C = TypeVar("C", bound="BaseConfig")
@@ -599,6 +600,58 @@ class EvaluatorConfig(BaseConfig):
     sft: bool = False
 
 
+@dataclass
+class UncertaintyScoringConfig(BaseConfig):
+    enabled: bool = False
+    """
+    If True, score mode writes multiple stochastic per-example losses instead of one point-estimate loss.
+    """
+
+    num_samples: int = 10
+    """
+    Number of stochastic forward passes to run per batch.
+    """
+
+    perturbation_type: str = "dropout"
+    """
+    Perturbation to use for stochastic scoring. Supported values: "dropout" and "activation_noise".
+    """
+
+    selection_metric: str = "lcb"
+    """
+    Uncertainty-aware metric used by index generation. Supported values: mean, std, lcb, prob_positive, g_snr.
+    """
+
+    lcb_alpha: float = 1.0
+    """
+    Standard-deviation multiplier used for the lower confidence bound.
+    """
+
+    coupled_masks: bool = True
+    """
+    If True, use deterministic sample seeds so prior and conditional score runs can share perturbation masks.
+    """
+
+    activation_noise_std: float = 0.01
+    """
+    Standard deviation for activation_noise perturbations.
+    """
+
+    def __post_init__(self):
+        if self.num_samples < 1:
+            raise OLMoConfigurationError("uncertainty_scoring.num_samples must be at least 1")
+        if self.perturbation_type not in ("dropout", "activation_noise"):
+            raise OLMoConfigurationError(
+                "uncertainty_scoring.perturbation_type must be 'dropout' or 'activation_noise'"
+            )
+        if self.selection_metric not in ("mean", "std", "lcb", "prob_positive", "g_snr"):
+            raise OLMoConfigurationError(
+                "uncertainty_scoring.selection_metric must be one of mean, std, lcb, prob_positive, g_snr"
+            )
+        if self.activation_noise_std < 0.0:
+            raise OLMoConfigurationError("uncertainty_scoring.activation_noise_std must be non-negative")
+
+
 class TruncationDirection(StrEnum):
     right = "right"
     left = "left"
@@ -791,6 +844,11 @@ class TrainConfig(BaseConfig):
     data_start_step: Optional[int] = None
     """
     If not none, set the start index to a specific value. If none, start at 0.
+    """
+
+    uncertainty_scoring: UncertaintyScoringConfig = field(default_factory=UncertaintyScoringConfig)
+    """
+    Configs for stochastic uncertainty-aware scoring and index generation.
     """
 
     sft_dataset: Optional[EvaluatorConfig] = None

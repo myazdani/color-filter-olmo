@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import logging
 import time
+from contextlib import contextmanager
 from typing import Any, Dict, Optional
 from pathlib import Path
 
 import numpy as np
 import torch
+from torch import nn
 import wandb
 
 from .data import DictMemmapWriter
@@ -17,6 +19,86 @@ log = logging.getLogger(__name__)
 
 
 class Scorer(Trainer):
+    @property
+    def stochastic_scoring_enabled(self) -> bool:
+        return self.cfg.uncertainty_scoring.enabled
+
+    @property
+    def num_stochastic_samples(self) -> int:
+        if not self.stochastic_scoring_enabled:
+            return 1
+        if self.cfg.uncertainty_scoring.num_samples < 1:
+            raise ValueError("uncertainty_scoring.num_samples must be at least 1")
+        return self.cfg.uncertainty_scoring.num_samples
+
+    @contextmanager
+    def stochastic_perturbation(self):
+        was_training = self.fsdp_model.training
+        perturbation_type = self.cfg.uncertainty_scoring.perturbation_type
+        handles = []
+
+        try:
+            if perturbation_type == "dropout":
+                self.fsdp_model.train()
+            elif perturbation_type == "activation_noise":
+                self.fsdp_model.eval()
+                noise_std = self.cfg.uncertainty_scoring.activation_noise_std
+
+                def add_noise(_module, _inputs, output):
+                    if noise_std == 0.0:
+                        return output
+                    if isinstance(output, torch.Tensor):
+                        return output + torch.randn_like(output) * noise_std
+                    return output
+
+                for module in self.fsdp_model.modules():
+                    if isinstance(module, nn.Linear):
+                        handles.append(module.register_forward_hook(add_noise))
+            else:
+                raise ValueError(
+                    "uncertainty_scoring.perturbation_type must be 'dropout' or 'activation_noise'"
+                )
+
+            yield
+        finally:
+            for handle in handles:
+                handle.remove()
+            if was_training:
+                self.fsdp_model.train()
+            else:
+                self.fsdp_model.eval()
+
+    def set_stochastic_sample_seed(self, sample_idx: int):
+        sample_seed = self.cfg.seed + (self.global_step * self.num_stochastic_samples) + sample_idx
+        if not self.cfg.uncertainty_scoring.coupled_masks:
+            sample_seed += int(time.time())
+        torch.manual_seed(sample_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(sample_seed)
+
+    def compute_batch_loss_samples(self, micro_batches) -> tuple[torch.Tensor, torch.Tensor]:
+        batch_sample_scores = []
+        batch_loss = torch.tensor(0.0, device=self.device)
+
+        with self.stochastic_perturbation():
+            for sample_idx in range(self.num_stochastic_samples):
+                self.set_stochastic_sample_seed(sample_idx)
+                sample_scores = []
+                sample_loss = torch.tensor(0.0, device=self.device)
+                for micro_batch in micro_batches:
+                    with torch.autocast(
+                        "cuda",
+                        enabled=self.device.type == "cuda",
+                        dtype=self.cfg.autocast_precision,
+                    ):
+                        loss, _ = self.model_forward(micro_batch, loss_reduction="none", return_logits=False)
+                        loss = loss.mean(dim=-1, keepdim=True)
+                        sample_scores.append(loss)
+                        sample_loss += loss.mean().detach() / len(micro_batches)
+                batch_sample_scores.append(torch.concatenate(sample_scores, dim=0))
+                batch_loss += sample_loss / self.num_stochastic_samples
+
+        return torch.concatenate(batch_sample_scores, dim=1), batch_loss
 
     def score_step(self, batch: Dict[str, Any]) -> Dict[str, float]:
         metrics: Dict[str, float] = {}
@@ -30,16 +112,23 @@ class Scorer(Trainer):
         # Move tensors to the right device.
         batch = move_to_device(batch, self.device)
         micro_batches = self.split_batch(batch)
-        batch_scores = []
-        batch_loss = torch.tensor(0.0, device=self.device)
-        for micro_batch in micro_batches:
-            with torch.autocast("cuda", enabled=True, dtype=self.cfg.autocast_precision):
-                loss, _ = self.model_forward(micro_batch, loss_reduction="none", return_logits=False)
-                loss = loss.mean(dim=-1, keepdim=True)
-                batch_scores.append(loss)
+        if self.stochastic_scoring_enabled:
+            batch_scores, batch_loss = self.compute_batch_loss_samples(micro_batches)
+        else:
+            batch_scores = []
+            batch_loss = torch.tensor(0.0, device=self.device)
+            for micro_batch in micro_batches:
+                with torch.autocast(
+                    "cuda",
+                    enabled=self.device.type == "cuda",
+                    dtype=self.cfg.autocast_precision,
+                ):
+                    loss, _ = self.model_forward(micro_batch, loss_reduction="none", return_logits=False)
+                    loss = loss.mean(dim=-1, keepdim=True)
+                    batch_scores.append(loss)
 
-                batch_loss += loss.mean().detach() / len(micro_batches)
-        batch_scores = torch.concatenate(batch_scores, dim=0)
+                    batch_loss += loss.mean().detach() / len(micro_batches)
+            batch_scores = torch.concatenate(batch_scores, dim=0)
         batch_data["score"] = batch_scores.detach().cpu()
         batch_data["index"] = batch["index"].detach().cpu()
         metrics["train/Loss"] = batch_loss.item()
@@ -54,7 +143,7 @@ class Scorer(Trainer):
         data_writer = DictMemmapWriter(
             Path(self.cfg.save_folder) / "score",
             memmap_dtype=np.float32,
-            seq_len=1,
+            seq_len=self.num_stochastic_samples,
         )
 
         # Initialize monitors.
