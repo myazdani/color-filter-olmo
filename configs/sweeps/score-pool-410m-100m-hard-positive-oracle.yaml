@@ -1,0 +1,97 @@
+run_name: score_pool_410m_100m_hard_positive_oracle
+seed: 17
+dry_run: false
+
+max_duration: 764
+global_train_batch_size: 256
+device_train_microbatch_size: 16
+
+model:
+  d_model: 1280
+  mlp_hidden_size: 5120
+  n_heads: 20
+  n_layers: 20
+  max_sequence_length: 512
+  rope: true
+  attention_layer_norm: true
+  attention_layer_norm_with_affine: true
+  multi_query_attention: false
+  include_bias: false
+  block_type: sequential
+  layer_norm_type: default
+  layer_norm_with_affine: true
+  bias_for_layer_norm: false
+  activation_type: gelu
+  attention_dropout: 0.0
+  residual_dropout: 0.0
+  embedding_dropout: 0.0
+  vocab_size: 50280
+  embedding_size: 50304
+  eos_token_id: 0
+  pad_token_id: 1
+  init_device: meta
+  init_fn: mitchell
+  weight_tying: false
+
+compile: null
+precision: amp_bf16
+max_grad_norm: 1.0
+
+fsdp:
+  precision: mixed
+  sharding_strategy: FULL_SHARD
+
+scheduler:
+  name: cosine_with_warmup
+  t_warmup: 80
+  alpha_f: 0.1
+
+optimizer:
+  name: adamw
+  learning_rate: 1.0e-3
+  weight_decay: 0.0
+  eps: 1.0e-15
+  betas:
+    - 0.9
+    - 0.95
+  metrics_log_interval: 10
+
+activation_checkpointing: null
+softmax_auxiliary_loss: true
+save_data_indices: false
+
+data:
+  paths:
+    - ${oc.env:SCORE_POOL_TRAIN_DATA_DIR}/hard_positive_oracle_100k/train_tokens.npy
+  pad_direction: right
+  num_workers: 4
+  drop_last: true
+  pin_memory: true
+  prefetch_factor: 4
+  persistent_workers: true
+  timeout: 0
+  memmap_dtype: uint16
+  extra_data_paths: null
+
+tokenizer:
+  identifier: allenai/eleuther-ai-gpt-neox-20b-pii-special
+  truncate_direction: right
+
+save_folder: ${oc.env:SCORE_POOL_CHECKPOINTS_DIR}/${run_name}
+save_overwrite: false
+save_interval: 100
+save_num_checkpoints_to_keep: 1
+save_interval_unsharded: null
+save_num_unsharded_checkpoints_to_keep: 0
+no_pre_train_checkpoint: true
+load_path: null
+
+speed_monitor:
+  window_size: 1
+
+console_log_interval: 10
+eval_interval: 100
+eval_on_load: false
+eval_subset_num_batches: 100
+device_eval_batch_size: 16
+evaluators: []
