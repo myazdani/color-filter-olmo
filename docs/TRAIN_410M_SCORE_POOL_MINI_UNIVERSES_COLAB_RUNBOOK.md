@@ -37,8 +37,9 @@ Expected Drive location:
 MyDrive/color-filter-ablation/data/train-410m-score-pool-mini-universes
 ```
 
-Production outputs intentionally use the `-2ep` experiment suffix so a fresh
-two-epoch rerun cannot be confused with earlier one-epoch or partial outputs.
+Production outputs intentionally use the `-2ep-full-eval` experiment suffix so
+a fresh two-epoch rerun with Books/C4 learning curves cannot be confused with
+earlier one-epoch, partial, or no-eval outputs.
 
 The Books validation data is downloaded from the original CoLoR-Filter Hugging
 Face model repo:
@@ -123,7 +124,7 @@ from pathlib import Path
 
 DRIVE = Path("/content/drive/MyDrive/color-filter-ablation")
 TRAIN_DATASET = "train-410m-score-pool-mini-universes"
-EXPERIMENT = "train-410m-score-pool-mini-universes-2ep"
+EXPERIMENT = "train-410m-score-pool-mini-universes-2ep-full-eval"
 
 TRAIN_DATA_DRIVE = DRIVE / "data" / TRAIN_DATASET
 EVAL_DATA_DRIVE = DRIVE / "data" / "eval" / EXPERIMENT
@@ -588,12 +589,15 @@ import os
 import subprocess
 from pathlib import Path
 
-def run_logged(cmd, log_path: Path, cwd: Path = OLMO_DIR) -> None:
+def run_logged(cmd, log_path: Path, cwd: Path = OLMO_DIR, append: bool = False) -> None:
     env = os.environ.copy()
     env["PYTHONPATH"] = str(OLMO_DIR)
     log_path.parent.mkdir(parents=True, exist_ok=True)
+    mode = "a" if append else "w"
     print("command:", " ".join(str(x) for x in cmd))
-    with log_path.open("w", encoding="utf-8") as log:
+    with log_path.open(mode, encoding="utf-8") as log:
+        if append:
+            log.write("\n\n===== RESUMED RUN =====\n")
         proc = subprocess.Popen(
             [str(x) for x in cmd],
             cwd=str(cwd),
@@ -820,9 +824,11 @@ print("MICROBATCH:", MICROBATCH)
 
 ## 7. Full Resumable Training Runs
 
-Full run. Train all four models in the P0 order. The helper skips logs that
-already contain `Training complete` and resumes from the latest checkpoint when
-one exists, so the loop is safe to rerun after an interruption.
+Full run. Train all four models in the P0 order under the fresh eval-enabled
+experiment directory. The helper skips only logs that contain `Training complete`
+and the expected eval curves. If interrupted before completion, it appends to
+the existing log and resumes from the latest checkpoint so partial learning
+curves are preserved.
 
 ```python
 # PYTHON CELL
@@ -833,13 +839,45 @@ production_order = [
     "hard_pair_cascade_100k",
 ]
 
+EXPECTED_EVAL_POINTS = 10
+
+def production_log_status(log_path: Path) -> dict:
+    if not log_path.exists():
+        return {
+            "exists": False,
+            "training_complete": False,
+            "books_eval_points": 0,
+            "c4_eval_points": 0,
+            "has_required_eval_curve": False,
+        }
+    text = log_path.read_text(errors="ignore")
+    books_eval_points = text.count("eval/books_val/CrossEntropyLoss")
+    c4_eval_points = text.count("eval/c4_val_proxy/CrossEntropyLoss")
+    return {
+        "exists": True,
+        "training_complete": "Training complete" in text[-30_000:],
+        "books_eval_points": books_eval_points,
+        "c4_eval_points": c4_eval_points,
+        "has_required_eval_curve": (
+            books_eval_points >= EXPECTED_EVAL_POINTS
+            and c4_eval_points >= EXPECTED_EVAL_POINTS
+        ),
+    }
+
 def run_training(run_id: str) -> None:
     cfg_path = runtime_config_map[run_id]
     save_path = CHECKPOINTS_DRIVE / run_id
     log_path = RESULTS_DRIVE / f"{run_id}.log"
-    if log_path.exists() and "Training complete" in log_path.read_text(errors="ignore")[-30_000:]:
-        print(f"skipping completed run: {run_id}")
-        return
+    status = production_log_status(log_path)
+    if status["training_complete"]:
+        if status["has_required_eval_curve"]:
+            print(f"skipping completed run with eval curves: {run_id}")
+            return
+        raise RuntimeError(
+            f"{run_id} is complete but missing required eval curves: {status}. "
+            "Do not resume from step780 if you need learning curves. Use a fresh "
+            "EXPERIMENT/output directory or intentionally rerun from scratch."
+        )
 
     args = [
         "torchrun",
@@ -855,7 +893,7 @@ def run_training(run_id: str) -> None:
     elif save_path.exists() and any(save_path.iterdir()):
         raise RuntimeError(f"{save_path} exists but has no step checkpoints. Inspect before overwriting.")
 
-    run_logged(args, log_path)
+    run_logged(args, log_path, append=log_path.exists())
 
 for run_id in production_order:
     run_training(run_id)
@@ -883,6 +921,8 @@ for run_id in production_order:
     if log_path.exists():
         tail = log_path.read_text(errors="ignore")[-2000:]
         print("complete:", "Training complete" in tail)
+        if "production_log_status" in globals():
+            print("eval status:", production_log_status(log_path))
     if save_path.exists():
         print("checkpoints:", [p.name for p in sorted(save_path.glob("step*"))])
     else:
@@ -908,6 +948,13 @@ all artifacts directly to Drive.
 # PYTHON CELL
 import subprocess
 
+report_run_ids = globals().get("production_order", [
+    "random_positive_oracle_100k",
+    "random_pair_cascade_100k",
+    "hard_positive_oracle_100k",
+    "hard_pair_cascade_100k",
+])
+
 def build_report_cmd(check_only: bool = False) -> list[str]:
     cmd = [
         "python",
@@ -923,13 +970,45 @@ def build_report_cmd(check_only: bool = False) -> list[str]:
         "--olmo-sha", OLMO_SHA,
         "--sequence-length", str(SEQ_LEN),
         "--eval-subset-num-batches", str(EVAL_SUBSET_NUM_BATCHES),
+        "--eval-interval", "78",
         "--device-eval-batch-size", str(DEVICE_EVAL_BATCH_SIZE),
     ]
     if check_only:
         cmd.append("--check-only")
     return cmd
 
-subprocess.run(build_report_cmd(), cwd=OLMO_DIR, check=True)
+def assert_eval_curves_ready() -> None:
+    problems = []
+    for run_id in report_run_ids:
+        log_path = RESULTS_DRIVE / f"{run_id}.log"
+        text = log_path.read_text(errors="ignore") if log_path.exists() else ""
+        books = text.count("eval/books_val/CrossEntropyLoss")
+        c4 = text.count("eval/c4_val_proxy/CrossEntropyLoss")
+        complete = "Training complete" in text[-30_000:]
+        ok = complete and books >= 10 and c4 >= 10
+        print(run_id, "complete=", complete, "books_eval_points=", books, "c4_eval_points=", c4, "ok=", ok)
+        if not ok:
+            problems.append((run_id, complete, books, c4))
+    if problems:
+        raise RuntimeError(
+            "Missing required eval learning curves. Rerun Step 7 from scratch with eval-enabled configs. "
+            f"Problems: {problems}"
+        )
+
+def run_report_helper(check_only: bool = False) -> None:
+    proc = subprocess.run(
+        build_report_cmd(check_only=check_only),
+        cwd=OLMO_DIR,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    print(proc.stdout)
+    if proc.returncode != 0:
+        raise RuntimeError(f"Report helper failed with exit code {proc.returncode}")
+
+assert_eval_curves_ready()
+run_report_helper()
 ```
 
 Optional quick previews:
@@ -950,9 +1029,9 @@ print("figures:", sorted(p.name for p in FIGURES_DRIVE.glob("*.png")))
 The durable outputs are under:
 
 ```text
-MyDrive/color-filter-ablation/results/train-410m-score-pool-mini-universes-2ep
-MyDrive/color-filter-ablation/reports/train-410m-score-pool-mini-universes-2ep
-MyDrive/color-filter-ablation/checkpoints/train-410m-score-pool-mini-universes-2ep
+MyDrive/color-filter-ablation/results/train-410m-score-pool-mini-universes-2ep-full-eval
+MyDrive/color-filter-ablation/reports/train-410m-score-pool-mini-universes-2ep-full-eval
+MyDrive/color-filter-ablation/checkpoints/train-410m-score-pool-mini-universes-2ep-full-eval
 ```
 
 The required report figures are:
@@ -975,9 +1054,8 @@ files, all required figures, final eval curves, final step780 checkpoints, and
 
 ```python
 # PYTHON CELL
-import subprocess
-
-subprocess.run(build_report_cmd(check_only=True), cwd=OLMO_DIR, check=True)
+assert_eval_curves_ready()
+run_report_helper(check_only=True)
 ```
 
 ## 12. Stop Rules And Interpretation

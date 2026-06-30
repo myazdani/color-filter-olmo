@@ -50,7 +50,11 @@ def parse_timestamp(line: str) -> datetime | None:
     return datetime.strptime(match.group(1), "%Y-%m-%d %H:%M:%S.%f")
 
 
-def parse_logs(results_dir: Path, run_ids: Iterable[str]) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def parse_logs(
+    results_dir: Path,
+    run_ids: Iterable[str],
+    eval_interval: int,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     step_re = re.compile(r"\[step=(\d+)/(\d+)\]")
     metric_re = re.compile(r"^\s+([^=]+)=([0-9.,eE+-]+)\s*$")
 
@@ -66,6 +70,8 @@ def parse_logs(results_dir: Path, run_ids: Iterable[str]) -> tuple[pd.DataFrame,
 
         current_train: dict[str, object] | None = None
         current_eval_label: str | None = None
+        current_eval_step: int | None = None
+        eval_round = 0
         last_step: int | None = None
         checkpoint_start: datetime | None = None
 
@@ -103,9 +109,13 @@ def parse_logs(results_dir: Path, run_ids: Iterable[str]) -> tuple[pd.DataFrame,
                 checkpoint_start = None
 
             if "INFO\tbooks_val" in line:
+                eval_round += 1
+                current_eval_step = eval_round * eval_interval
                 current_eval_label = "books_val"
                 continue
             if "INFO\tc4_val_proxy" in line:
+                if current_eval_step is None:
+                    current_eval_step = max(eval_round, 1) * eval_interval
                 current_eval_label = "c4_val_proxy"
                 continue
 
@@ -119,7 +129,7 @@ def parse_logs(results_dir: Path, run_ids: Iterable[str]) -> tuple[pd.DataFrame,
                 eval_rows.append(
                     {
                         "run_id": run_id,
-                        "step": last_step,
+                        "step": current_eval_step or last_step,
                         "label": current_eval_label,
                         "metric": name.split("/")[-1],
                         "value": value,
@@ -341,6 +351,8 @@ def write_report(
     eval_subset_num_batches: int,
     device_eval_batch_size: int,
     selection: pd.DataFrame,
+    sensitivity: pd.DataFrame,
+    overlap: pd.DataFrame,
     train_metrics: pd.DataFrame,
     eval_metrics: pd.DataFrame,
 ) -> None:
@@ -383,9 +395,61 @@ def write_report(
         f"- C4 eval source: `{manifest['c4_val_proxy']['source']}`",
         f"- C4 caveat: {manifest['c4_val_proxy']['note']}",
         "",
+        "## Mini-Universe Definitions",
+        "",
+        "- `random_positive_oracle_100k`: all 100K rows from `random_positive`.",
+        "- `hard_positive_oracle_100k`: all 100K rows from `hard_positive`.",
+        (
+            "- `random_pair_cascade_100k`: rank `random_positive union random_negative` "
+            "with `pair_mid2`, keep `m * 100K` candidates, then rerank by full CoLoR."
+        ),
+        (
+            "- `hard_pair_cascade_100k`: rank `hard_positive union hard_negative` "
+            "with `pair_mid2`, keep `m * 100K` candidates, then rerank by full CoLoR."
+        ),
+        "- Cascade multiplier for trained P0 runs: `m = 1.5`.",
+        "- Score convention: `conditional_books_loss - prior_loss`; lower is better.",
+        "",
+        "## Matched Training Setup",
+        "",
+        "- Total parameters: `522,097,920`.",
+        "- Non-embedding parameters: `393,319,680`.",
+        "- Architecture: `d_model=1280`, `n_layers=20`, `n_heads=20`, sequence length `512`.",
+        "- Seed: `17`.",
+        "- Global train batch size: `256` sequences.",
+        "- Training duration: `2ep`, which is `780` optimizer steps for each 100K-row memmap.",
+        "- Eval interval: every `78` optimizer steps, including final step `780`.",
+        "",
         "## Selection Diagnostics",
         "",
         md_table(selection, ["run_id", "selected_rows", "true_positive_count", "true_positive_rate", "oracle_positive_recall"]),
+        "",
+        "## Cascade Multiplier Sensitivity",
+        "",
+        (
+            md_table(
+                sensitivity,
+                [
+                    col
+                    for col in [
+                        "run_id",
+                        "cascade_multiplier",
+                        "candidate_count",
+                        "true_positive_count",
+                        "true_positive_rate",
+                        "oracle_positive_recall",
+                        "trained_p0",
+                    ]
+                    if col in sensitivity.columns
+                ],
+            )
+            if not sensitivity.empty
+            else "_No sensitivity diagnostics found._"
+        ),
+        "",
+        "## Selected Set Overlap",
+        "",
+        md_table(overlap) if not overlap.empty else "_No overlap diagnostics parsed._",
         "",
         "## Final Training Metrics",
         "",
@@ -466,7 +530,7 @@ def write_metrics_and_report(args: argparse.Namespace) -> None:
     args.reports_dir.mkdir(parents=True, exist_ok=True)
     (args.reports_dir / "figures").mkdir(parents=True, exist_ok=True)
 
-    train_metrics, eval_metrics, checkpoint_saves = parse_logs(args.results_dir, run_ids)
+    train_metrics, eval_metrics, checkpoint_saves = parse_logs(args.results_dir, run_ids, args.eval_interval)
     train_metrics.to_csv(args.results_dir / "train_metrics_from_logs.csv", index=False)
     eval_metrics.to_csv(args.results_dir / "eval_metrics_from_logs.csv", index=False)
     checkpoint_saves.to_csv(args.results_dir / "checkpoint_save_times.csv", index=False)
@@ -491,8 +555,12 @@ def write_metrics_and_report(args: argparse.Namespace) -> None:
 
     selection = pd.read_csv(args.train_data_dir / "selection_diagnostics.csv")
     overlap = pd.read_csv(args.train_data_dir / "overlap_jaccard.csv")
+    sensitivity_path = args.train_data_dir / "selection_sensitivity.csv"
+    sensitivity = pd.read_csv(sensitivity_path) if sensitivity_path.exists() else pd.DataFrame()
     selection.to_csv(args.results_dir / "selection_diagnostics.csv", index=False)
     overlap.to_csv(args.results_dir / "overlap_jaccard.csv", index=False)
+    if not sensitivity.empty:
+        sensitivity.to_csv(args.results_dir / "selection_sensitivity.csv", index=False)
 
     checkpoint_manifest = {
         "experiment": args.experiment,
@@ -530,6 +598,8 @@ def write_metrics_and_report(args: argparse.Namespace) -> None:
         eval_subset_num_batches=args.eval_subset_num_batches,
         device_eval_batch_size=args.device_eval_batch_size,
         selection=selection,
+        sensitivity=sensitivity,
+        overlap=overlap,
         train_metrics=train_metrics,
         eval_metrics=eval_metrics,
     )
@@ -541,6 +611,7 @@ def acceptance_check(args: argparse.Namespace) -> None:
     required_artifacts = [
         args.results_dir / "train_metrics_from_logs.csv",
         args.results_dir / "eval_metrics_from_logs.csv",
+        args.results_dir / "checkpoint_save_times.csv",
         args.results_dir / "throughput_comparison.csv",
         args.results_dir / "selection_diagnostics.csv",
         args.results_dir / "overlap_jaccard.csv",
@@ -548,6 +619,8 @@ def acceptance_check(args: argparse.Namespace) -> None:
         args.reports_dir / "report.md",
         args.reports_dir / "report.html",
     ]
+    if (args.train_data_dir / "selection_sensitivity.csv").exists():
+        required_artifacts.append(args.results_dir / "selection_sensitivity.csv")
     required_figures = [args.reports_dir / "figures" / name for name in FIGURES]
     for path in required_artifacts + required_figures:
         if not path.exists() or path.stat().st_size == 0:
@@ -580,6 +653,19 @@ def acceptance_check(args: argparse.Namespace) -> None:
     )
     if not (final_eval_steps == 780).all():
         raise AssertionError(final_eval_steps)
+    expected_eval_points = 780 // args.eval_interval
+    expected_eval_index = pd.MultiIndex.from_product(
+        [list(args.run_id), ["books_val", "c4_val_proxy"]],
+        names=["run_id", "label"],
+    )
+    eval_counts = (
+        eval_metrics[eval_metrics["metric"] == "CrossEntropyLoss"]
+        .groupby(["run_id", "label"])["step"]
+        .nunique()
+        .reindex(expected_eval_index, fill_value=0)
+    )
+    if not (eval_counts >= expected_eval_points).all():
+        raise AssertionError(eval_counts)
     print(
         eval_metrics[eval_metrics["metric"] == "CrossEntropyLoss"]
         .sort_values(["run_id", "label", "step"])
@@ -607,6 +693,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--olmo-sha", default="")
     parser.add_argument("--sequence-length", type=int, default=512)
     parser.add_argument("--eval-subset-num-batches", type=int, default=100)
+    parser.add_argument("--eval-interval", type=int, default=78)
     parser.add_argument("--device-eval-batch-size", type=int, default=16)
     parser.add_argument("--run-id", action="append", default=None)
     parser.add_argument("--check-only", action="store_true")
