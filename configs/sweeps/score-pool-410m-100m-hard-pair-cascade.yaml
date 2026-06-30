@@ -2,7 +2,7 @@ run_name: score_pool_410m_100m_hard_pair_cascade
 seed: 17
 dry_run: false
 
-max_duration: 764
+max_duration: 2ep
 global_train_batch_size: 256
 device_train_microbatch_size: 16
 
@@ -79,8 +79,8 @@ tokenizer:
 
 save_folder: ${oc.env:SCORE_POOL_CHECKPOINTS_DIR}/${run_name}
 save_overwrite: false
-save_interval: 100
-save_num_checkpoints_to_keep: 1
+save_interval: 390
+save_num_checkpoints_to_keep: 2
 save_interval_unsharded: null
 save_num_unsharded_checkpoints_to_keep: 0
 no_pre_train_checkpoint: true
@@ -90,7 +90,7 @@ speed_monitor:
   window_size: 1
 
 console_log_interval: 10
-eval_interval: 100
+eval_interval: 78
 eval_on_load: false
 eval_subset_num_batches: 100
 device_eval_batch_size: 16
