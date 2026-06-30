@@ -12,6 +12,32 @@ The token datasets are built locally by
 `color-filter-ablation/scripts/18_build_score_pool_training_sets.py` and then
 uploaded to Drive. This notebook should not rebuild the official 500K recovery.
 
+Before starting Colab, the local dataset folder must exist on Google Drive at:
+
+```text
+MyDrive/color-filter-ablation/data/train-410m-score-pool-mini-universes
+```
+
+From the laptop, the local source folder is:
+
+```text
+/Users/myazdani/Documents/CI-CoLoR/color-filter-ablation/data/train-410m-score-pool-mini-universes
+```
+
+If using the local Google Drive sync folder, run this from the laptop terminal,
+not from Colab:
+
+```bash
+SRC="/Users/myazdani/Documents/CI-CoLoR/color-filter-ablation/data/train-410m-score-pool-mini-universes"
+DST="/Users/myazdani/Google Drive/color-filter-ablation/data/train-410m-score-pool-mini-universes"
+
+test -d "$SRC" || { echo "missing source: $SRC"; exit 1; }
+mkdir -p "$(dirname "$DST")"
+rsync -a --info=progress2 "$SRC/" "$DST/"
+```
+
+Wait for Google Drive sync to finish before running Section 3.
+
 ## 0. Resource Assumptions
 
 Use an A100 80GB runtime if possible. This workflow reuses existing Drive
@@ -172,6 +198,7 @@ overlay = [
     "cached_path==1.8.10",
     "boto3",
     "google-cloud-storage",
+    "torchmetrics",
     "wandb",
 ]
 subprocess.run(["python", "-m", "pip", "install", "-q", *overlay], check=True)
@@ -184,7 +211,15 @@ Keep the Colab-provided CUDA PyTorch build unless the import check fails.
 import importlib
 import torch
 
-for module_name in ["numpy", "yaml", "omegaconf", "cached_path", "boto3", "wandb"]:
+for module_name in [
+    "numpy",
+    "yaml",
+    "omegaconf",
+    "cached_path",
+    "boto3",
+    "torchmetrics",
+    "wandb",
+]:
     importlib.import_module(module_name)
 print("torch:", torch.__version__)
 print("cuda:", torch.version.cuda)
@@ -299,7 +334,16 @@ Safe to rerun. This is the model-load gate before the first training command.
 
 ```python
 # PYTHON CELL
+import os
+import sys
 from pathlib import Path
+
+OLMO_DIR = Path("/content/color-filter-olmo")
+assert (OLMO_DIR / "olmo/config.py").exists(), OLMO_DIR
+os.chdir(OLMO_DIR)
+if str(OLMO_DIR) not in sys.path:
+    sys.path.insert(0, str(OLMO_DIR))
+
 from olmo.config import TrainConfig
 from olmo.model import OLMo
 
