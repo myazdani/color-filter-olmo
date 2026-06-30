@@ -37,6 +37,9 @@ Expected Drive location:
 MyDrive/color-filter-ablation/data/train-410m-score-pool-mini-universes
 ```
 
+Production outputs intentionally use the `-2ep` experiment suffix so a fresh
+two-epoch rerun cannot be confused with earlier one-epoch or partial outputs.
+
 The Books validation data is downloaded from the original CoLoR-Filter Hugging
 Face model repo:
 
@@ -119,9 +122,10 @@ Safe to rerun. Define all stable paths:
 from pathlib import Path
 
 DRIVE = Path("/content/drive/MyDrive/color-filter-ablation")
-EXPERIMENT = "train-410m-score-pool-mini-universes"
+TRAIN_DATASET = "train-410m-score-pool-mini-universes"
+EXPERIMENT = "train-410m-score-pool-mini-universes-2ep"
 
-TRAIN_DATA_DRIVE = DRIVE / "data" / EXPERIMENT
+TRAIN_DATA_DRIVE = DRIVE / "data" / TRAIN_DATASET
 EVAL_DATA_DRIVE = DRIVE / "data" / "eval" / EXPERIMENT
 CHECKPOINTS_DRIVE = DRIVE / "checkpoints" / EXPERIMENT
 RESULTS_DRIVE = DRIVE / "results" / EXPERIMENT
@@ -132,6 +136,8 @@ RUNTIME_CONFIG_DIR = Path("/content/score_pool_410m_runtime_configs")
 for path in [EVAL_DATA_DRIVE, CHECKPOINTS_DRIVE, RESULTS_DRIVE, REPORTS_DRIVE, FIGURES_DRIVE, RUNTIME_CONFIG_DIR]:
     path.mkdir(parents=True, exist_ok=True)
 
+print("training dataset:", TRAIN_DATASET)
+print("experiment:", EXPERIMENT)
 print("train data:", TRAIN_DATA_DRIVE)
 print("eval data:", EVAL_DATA_DRIVE)
 print("checkpoints:", CHECKPOINTS_DRIVE)
@@ -261,10 +267,12 @@ Capability probe. Verify required files exist at the pinned SHAs:
 ```python
 # PYTHON CELL
 from pathlib import Path
+import subprocess
 
 required_paths = [
     Path("/content/CoLoR-ablation/scripts/18_build_score_pool_training_sets.py"),
     Path("/content/color-filter-olmo/scripts/train.py"),
+    Path("/content/color-filter-olmo/scripts/score_pool_410m_report.py"),
     Path("/content/color-filter-olmo/configs/sweeps/score-pool-410m-100m-random-positive-oracle.yaml"),
     Path("/content/color-filter-olmo/configs/sweeps/score-pool-410m-100m-random-pair-cascade.yaml"),
     Path("/content/color-filter-olmo/configs/sweeps/score-pool-410m-100m-hard-positive-oracle.yaml"),
@@ -274,6 +282,14 @@ for path in required_paths:
     if not path.exists():
         raise FileNotFoundError(path)
     print("ok:", path)
+
+subprocess.run([
+    "python",
+    "-m",
+    "py_compile",
+    "/content/color-filter-olmo/scripts/score_pool_410m_report.py",
+], check=True)
+print("report helper compiles")
 ```
 
 ## 3. Prepare Train And Eval Data
@@ -622,6 +638,7 @@ for run_id, prod_cfg_path in runtime_config_map.items():
     cfg.max_duration = 5
     cfg.eval_interval = 5
     cfg.save_interval = 5
+    cfg.console_log_interval = 1
     cfg.save_num_checkpoints_to_keep = 1
     for ev in cfg.evaluators:
         ev.subset_num_batches = 2
@@ -650,12 +667,21 @@ Safe to rerun. Verify smoke logs contain train and eval metrics:
 
 ```python
 # PYTHON CELL
+required_smoke_markers = [
+    "train/CrossEntropyLoss",
+    "eval/books_val/CrossEntropyLoss",
+    "eval/c4_val_proxy/CrossEntropyLoss",
+    "Training complete",
+]
 for run_id in runs:
     log_path = SMOKE_DIR / f"{run_id}.log"
     text = log_path.read_text(errors="ignore")
-    assert "train/CrossEntropyLoss" in text, log_path
-    assert "eval/books_val/CrossEntropyLoss" in text, log_path
-    assert "eval/c4_val_proxy/CrossEntropyLoss" in text, log_path
+    missing = [marker for marker in required_smoke_markers if marker not in text]
+    if missing:
+        print("smoke log failed:", log_path)
+        print("missing markers:", missing)
+        print(text[-4000:])
+        raise AssertionError((log_path, missing))
     print("smoke ok:", run_id, log_path.stat().st_size)
 ```
 
@@ -675,19 +701,25 @@ print("deleted:", SMOKE_DIR)
 ## 6. Microbatch Tuning
 
 Benchmark only. Each test is bounded to 20 optimizer steps and has evaluators
-disabled so it measures training throughput.
+disabled so it measures training throughput. Because microbatch `32` was already
+stable on an A100 80GB, this ladder also probes `64`. If `64` OOMs, restart the
+Colab runtime before production and keep `MICROBATCH = 32`. Do not try larger
+values for this runbook unless you are intentionally doing a separate resource
+experiment.
 
 ```python
 # PYTHON CELL
 from omegaconf import OmegaConf
 
+MICROBATCH_CANDIDATES = [16, 32, 64]
+MICROBATCH_PEAK_LIMIT_MB = 72_000
 MICROBATCH_TEST_CONFIG_DIR = Path("/content/score_pool_410m_microbatch_configs")
 MICROBATCH_TEST_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 
 test_run = "random_positive_oracle_100k"
 base_cfg = OmegaConf.load(runtime_config_map[test_run])
 microbatch_config_map = {}
-for microbatch in [16, 32]:
+for microbatch in MICROBATCH_CANDIDATES:
     cfg = deepcopy(base_cfg)
     cfg.run_name = f"microbatch_test_{microbatch}"
     cfg.save_folder = str(CHECKPOINTS_DRIVE / f"microbatch_test_{microbatch}")
@@ -704,20 +736,28 @@ for microbatch in [16, 32]:
 
 ```python
 # PYTHON CELL
+microbatch_failures = {}
 for microbatch, cfg_path in microbatch_config_map.items():
     log_path = RESULTS_DRIVE / f"microbatch_test_{microbatch}.log"
-    run_logged([
-        "torchrun",
-        "--standalone",
-        "--nproc_per_node=1",
-        "scripts/train.py",
-        str(cfg_path),
-        f"--device_train_microbatch_size={microbatch}",
-        "--save_overwrite=true",
-    ], log_path)
+    try:
+        run_logged([
+            "torchrun",
+            "--standalone",
+            "--nproc_per_node=1",
+            "scripts/train.py",
+            str(cfg_path),
+            f"--device_train_microbatch_size={microbatch}",
+            "--save_overwrite=true",
+        ], log_path)
+    except RuntimeError as exc:
+        microbatch_failures[microbatch] = str(exc)
+        print(f"microbatch {microbatch} failed; using the best smaller completed value.")
+        print("If this was an OOM, restart the runtime before production training.")
+        break
 ```
 
-Safe to rerun. Estimate production time:
+Safe to rerun. Estimate production time and select the largest completed
+microbatch with memory headroom:
 
 ```python
 # PYTHON CELL
@@ -728,38 +768,61 @@ def parse_number(value: str) -> float:
     return float(value.replace(",", ""))
 
 tok_re = re.compile(r"throughput/device/tokens_per_second=([0-9.,]+)")
-for microbatch in [16, 32]:
+mem_re = re.compile(r"System/Peak GPU Memory \(MB\)=([0-9.,]+)")
+microbatch_results = []
+for microbatch in MICROBATCH_CANDIDATES:
     log_path = RESULTS_DRIVE / f"microbatch_test_{microbatch}.log"
     if not log_path.exists():
         print("missing:", log_path)
         continue
-    speeds = [parse_number(m.group(1)) for m in tok_re.finditer(log_path.read_text(errors="ignore"))]
+    text = log_path.read_text(errors="ignore")
+    speeds = [parse_number(m.group(1)) for m in tok_re.finditer(text)]
+    peaks = [parse_number(m.group(1)) for m in mem_re.finditer(text)]
+    completed = "Training complete" in text
     if not speeds:
         print("no throughput parsed for", microbatch)
         continue
     median_tps = statistics.median(speeds)
+    peak_mb = max(peaks) if peaks else float("nan")
     per_run_hours = 102_236_160 / median_tps / 3600
     total_hours = 4 * per_run_hours
+    result = {
+        "microbatch": microbatch,
+        "completed": completed,
+        "median_tps": median_tps,
+        "peak_mb": peak_mb,
+        "eta_per_run_hours": per_run_hours,
+        "eta_p0_total_hours": total_hours,
+    }
+    microbatch_results.append(result)
     print(
-        f"microbatch={microbatch} median_tps={median_tps:,.0f} "
+        f"microbatch={microbatch} completed={completed} "
+        f"median_tps={median_tps:,.0f} peak_mb={peak_mb:,.0f} "
         f"eta_per_run={per_run_hours:.2f}h eta_p0_total={total_hours:.2f}h"
     )
+
+stable = [
+    item for item in microbatch_results
+    if item["completed"] and item["peak_mb"] <= MICROBATCH_PEAK_LIMIT_MB
+]
+recommended_microbatch = max([item["microbatch"] for item in stable], default=32)
+print("recommended_microbatch:", recommended_microbatch)
 ```
 
-Set `MICROBATCH` to the largest stable value with enough memory headroom.
-Previous A100 80GB runs used `32` with peak memory around 46.8GB.
+Set `MICROBATCH` from the benchmark. If the benchmark cell was skipped, use the
+known-stable fallback `32`.
 
 ```python
 # PYTHON CELL
-MICROBATCH = 32
+MICROBATCH = globals().get("recommended_microbatch", 32)
 print("MICROBATCH:", MICROBATCH)
 ```
 
 ## 7. Full Resumable Training Runs
 
-Full run. Train one model at a time in the P0 order. The helper skips logs that
+Full run. Train all four models in the P0 order. The helper skips logs that
 already contain `Training complete` and resumes from the latest checkpoint when
-one exists.
+one exists, so the loop is safe to rerun after an interruption.
 
 ```python
 # PYTHON CELL
@@ -794,17 +857,8 @@ def run_training(run_id: str) -> None:
 
     run_logged(args, log_path)
 
-RUN_TO_TRAIN = "random_positive_oracle_100k"
-run_training(RUN_TO_TRAIN)
-```
-
-Run the cell above four times, changing `RUN_TO_TRAIN` in this order:
-
-```text
-random_positive_oracle_100k
-random_pair_cascade_100k
-hard_positive_oracle_100k
-hard_pair_cascade_100k
+for run_id in production_order:
+    run_training(run_id)
 ```
 
 Do not use `--save_overwrite=true` in production unless intentionally replacing
@@ -812,9 +866,9 @@ a run.
 
 ## 8. Resume After Disconnect
 
-After reconnect, rerun Sections 1, 2, 3, 4, and 6. If
-`/content/score_pool_train_data` still exists and Section 3 validation passes,
-the local data copy can be skipped.
+After reconnect, rerun Sections 1, 2, 3, 4, and the final `MICROBATCH`
+selection cell from Section 6. If `/content/score_pool_train_data` still exists
+and Section 3 validation passes, the local data copy can be skipped.
 
 Safe to rerun. Check status:
 
@@ -845,416 +899,50 @@ run_training(RUN_TO_RESUME)
 
 ## 9. Metrics, Figures, And Report
 
-Safe to rerun after any completed production logs exist. This cell parses train
-metrics, eval metrics, throughput, checkpoint save durations, and final
-checkpoints. It writes CSV/JSONL artifacts directly to Drive.
+Safe to rerun after any completed production logs exist. This calls the checked-in
+report helper so metrics parsing, figures, Markdown, HTML, and acceptance logic
+stay versioned with the repo instead of living as bulky notebook code. It writes
+all artifacts directly to Drive.
 
 ```python
 # PYTHON CELL
-from datetime import datetime
-import json
-import math
-import re
+import subprocess
 
-import numpy as np
-import pandas as pd
+def build_report_cmd(check_only: bool = False) -> list[str]:
+    cmd = [
+        "python",
+        "scripts/score_pool_410m_report.py",
+        "--train-data-dir", str(LOCAL_TRAIN_DATA),
+        "--results-dir", str(RESULTS_DRIVE),
+        "--reports-dir", str(REPORTS_DRIVE),
+        "--checkpoints-dir", str(CHECKPOINTS_DRIVE),
+        "--eval-manifest", str(EVAL_MANIFEST),
+        "--experiment", EXPERIMENT,
+        "--runtime-config-dir", str(RUNTIME_CONFIG_DIR),
+        "--ablation-sha", ABLATION_SHA,
+        "--olmo-sha", OLMO_SHA,
+        "--sequence-length", str(SEQ_LEN),
+        "--eval-subset-num-batches", str(EVAL_SUBSET_NUM_BATCHES),
+        "--device-eval-batch-size", str(DEVICE_EVAL_BATCH_SIZE),
+    ]
+    if check_only:
+        cmd.append("--check-only")
+    return cmd
 
-timestamp_re = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+)")
-step_re = re.compile(r"\[step=(\d+)/(\d+)\]")
-metric_re = re.compile(r"^\s+([^=]+)=([0-9.,eE+-]+)\s*$")
-eval_label_re = re.compile(r"\bINFO\t(books_val|c4_val_proxy)\n")
-
-def parse_float(text: str) -> float:
-    return float(text.replace(",", ""))
-
-def parse_ts(line: str):
-    match = timestamp_re.match(line)
-    if not match:
-        return None
-    return datetime.strptime(match.group(1), "%Y-%m-%d %H:%M:%S.%f")
-
-train_rows = []
-eval_rows = []
-checkpoint_rows = []
-
-for run_id in production_order:
-    log_path = RESULTS_DRIVE / f"{run_id}.log"
-    if not log_path.exists():
-        print("missing log:", log_path)
-        continue
-    current_train = None
-    current_eval_label = None
-    last_step = None
-    checkpoint_start = None
-    lines = log_path.read_text(errors="ignore").splitlines()
-    for line in lines:
-        step_match = step_re.search(line)
-        if step_match:
-            if current_train and "train_cross_entropy" in current_train:
-                train_rows.append(current_train)
-            last_step = int(step_match.group(1))
-            current_train = {
-                "run_id": run_id,
-                "step": last_step,
-                "max_step": int(step_match.group(2)),
-            }
-            current_eval_label = None
-            continue
-
-        if "Saving checkpoint..." in line:
-            checkpoint_start = parse_ts(line)
-        if "Checkpoint saved to" in line:
-            end = parse_ts(line)
-            duration = (end - checkpoint_start).total_seconds() if end and checkpoint_start else math.nan
-            checkpoint_rows.append({
-                "run_id": run_id,
-                "step": last_step,
-                "checkpoint_path": line.split("Checkpoint saved to", 1)[-1].strip(),
-                "save_seconds": duration,
-            })
-            checkpoint_start = None
-
-        if "INFO\tbooks_val" in line:
-            current_eval_label = "books_val"
-            continue
-        if "INFO\tc4_val_proxy" in line:
-            current_eval_label = "c4_val_proxy"
-            continue
-
-        metric_match = metric_re.match(line)
-        if not metric_match:
-            continue
-        name = metric_match.group(1).strip()
-        value = parse_float(metric_match.group(2))
-
-        if current_eval_label and name.startswith(f"eval/{current_eval_label}/"):
-            metric_name = name.split("/")[-1]
-            eval_rows.append({
-                "run_id": run_id,
-                "step": last_step,
-                "label": current_eval_label,
-                "metric": metric_name,
-                "value": value,
-            })
-            continue
-
-        if current_train is None:
-            continue
-        if name == "train/CrossEntropyLoss":
-            current_train["train_cross_entropy"] = value
-        elif name == "train/Perplexity":
-            current_train["train_perplexity"] = value
-        elif name == "throughput/device/tokens_per_second":
-            current_train["tokens_per_second"] = value
-        elif name == "throughput/device/batches_per_second":
-            current_train["batches_per_second"] = value
-        elif name == "throughput/total_tokens":
-            current_train["total_tokens"] = value
-        elif name == "System/Peak GPU Memory (MB)":
-            current_train["peak_gpu_memory_mb"] = value
-
-    if current_train and "train_cross_entropy" in current_train:
-        train_rows.append(current_train)
-
-train_metrics = pd.DataFrame(train_rows).sort_values(["run_id", "step"])
-eval_metrics_long = pd.DataFrame(eval_rows).sort_values(["run_id", "label", "step", "metric"])
-checkpoint_saves = pd.DataFrame(checkpoint_rows)
-
-train_metrics_path = RESULTS_DRIVE / "train_metrics_from_logs.csv"
-eval_metrics_path = RESULTS_DRIVE / "eval_metrics_from_logs.csv"
-checkpoint_saves_path = RESULTS_DRIVE / "checkpoint_save_times.csv"
-train_metrics.to_csv(train_metrics_path, index=False)
-eval_metrics_long.to_csv(eval_metrics_path, index=False)
-checkpoint_saves.to_csv(checkpoint_saves_path, index=False)
-
-for run_id, frame in train_metrics.groupby("run_id"):
-    frame.to_json(RESULTS_DRIVE / f"{run_id}_train_metrics.jsonl", orient="records", lines=True)
-
-throughput = (
-    train_metrics.groupby("run_id")
-    .agg(
-        final_step=("step", "max"),
-        final_train_cross_entropy=("train_cross_entropy", "last"),
-        final_train_perplexity=("train_perplexity", "last"),
-        median_tokens_per_second=("tokens_per_second", "median"),
-        max_peak_gpu_memory_mb=("peak_gpu_memory_mb", "max"),
-    )
-    .reset_index()
-)
-throughput_path = RESULTS_DRIVE / "throughput_comparison.csv"
-throughput.to_csv(throughput_path, index=False)
-
-selection = pd.read_csv(LOCAL_TRAIN_DATA / "selection_diagnostics.csv")
-selection.to_csv(RESULTS_DRIVE / "selection_diagnostics.csv", index=False)
-overlap = pd.read_csv(LOCAL_TRAIN_DATA / "overlap_jaccard.csv")
-overlap.to_csv(RESULTS_DRIVE / "overlap_jaccard.csv", index=False)
-
-checkpoint_manifest = {
-    "experiment": EXPERIMENT,
-    "checkpoints_root": str(CHECKPOINTS_DRIVE),
-    "runs": {},
-}
-for run_id in production_order:
-    run_dir = CHECKPOINTS_DRIVE / run_id
-    steps = sorted(p for p in run_dir.glob("step*") if p.is_dir()) if run_dir.exists() else []
-    checkpoint_manifest["runs"][run_id] = {
-        "checkpoint_dir": str(run_dir),
-        "step_dirs": [p.name for p in steps],
-        "has_final_step780": any(p.name == "step780" for p in steps),
-    }
-checkpoint_manifest_path = RESULTS_DRIVE / "checkpoint_manifest.json"
-checkpoint_manifest_path.write_text(json.dumps(checkpoint_manifest, indent=2))
-
-print("wrote:", train_metrics_path, len(train_metrics))
-print("wrote:", eval_metrics_path, len(eval_metrics_long))
-print("wrote:", throughput_path, len(throughput))
-print("wrote:", checkpoint_manifest_path)
+subprocess.run(build_report_cmd(), cwd=OLMO_DIR, check=True)
 ```
 
-Safe to rerun. Generate all required figures:
+Optional quick previews:
 
 ```python
 # PYTHON CELL
-import matplotlib.pyplot as plt
-import numpy as np
 import pandas as pd
 
-plt.style.use("default")
-
-def savefig(path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    plt.tight_layout()
-    plt.savefig(path, dpi=180)
-    plt.close()
-    print("wrote:", path)
-
-run_labels = {
-    "random_positive_oracle_100k": "Random positive oracle",
-    "random_pair_cascade_100k": "Random pair cascade",
-    "hard_positive_oracle_100k": "Hard positive oracle",
-    "hard_pair_cascade_100k": "Hard pair cascade",
-}
-
-if len(train_metrics):
-    plt.figure(figsize=(8, 5))
-    for run_id, frame in train_metrics.groupby("run_id"):
-        plt.plot(frame["step"], frame["train_cross_entropy"], marker="o", linewidth=1.5, label=run_labels.get(run_id, run_id))
-    plt.xlabel("Optimizer step")
-    plt.ylabel("Train cross entropy")
-    plt.title("Training Loss By Run")
-    plt.legend(fontsize=8)
-    plt.grid(alpha=0.3)
-    savefig(FIGURES_DRIVE / "train_loss_by_run.png")
-
-    plt.figure(figsize=(8, 5))
-    for run_id, frame in train_metrics.groupby("run_id"):
-        if "tokens_per_second" in frame:
-            plt.plot(frame["step"], frame["tokens_per_second"], marker="o", linewidth=1.5, label=run_labels.get(run_id, run_id))
-    plt.xlabel("Optimizer step")
-    plt.ylabel("Device tokens/sec")
-    plt.title("Throughput By Run")
-    plt.legend(fontsize=8)
-    plt.grid(alpha=0.3)
-    savefig(FIGURES_DRIVE / "tokens_per_second_by_run.png")
-
-eval_ce = eval_metrics_long[
-    (eval_metrics_long["metric"] == "CrossEntropyLoss")
-].copy() if len(eval_metrics_long) else pd.DataFrame()
-
-for label, filename, title in [
-    ("books_val", "eval_loss_books_by_run.png", "Books Validation Loss By Run"),
-    ("c4_val_proxy", "eval_loss_c4_by_run.png", "C4 Validation Proxy Loss By Run"),
-]:
-    frame = eval_ce[eval_ce["label"] == label] if len(eval_ce) else pd.DataFrame()
-    plt.figure(figsize=(8, 5))
-    if len(frame):
-        for run_id, group in frame.groupby("run_id"):
-            plt.plot(group["step"], group["value"], marker="o", linewidth=1.5, label=run_labels.get(run_id, run_id))
-    else:
-        plt.text(0.5, 0.5, f"No {label} eval metrics parsed", ha="center", va="center")
-    plt.xlabel("Optimizer step")
-    plt.ylabel("Eval cross entropy")
-    plt.title(title)
-    if len(frame):
-        plt.legend(fontsize=8)
-    plt.grid(alpha=0.3)
-    savefig(FIGURES_DRIVE / filename)
-
-def load_meta_frames():
-    frames = []
-    for run_id in production_order:
-        frame = pd.read_parquet(LOCAL_TRAIN_DATA / run_id / "train_meta.parquet")
-        frame["run_id"] = run_id
-        frames.append(frame)
-    return pd.concat(frames, ignore_index=True)
-
-meta_all = load_meta_frames()
-for column, filename, title in [
-    ("local_full_color_score", "selection_full_score_distributions.png", "Selected Full CoLoR Score Distributions"),
-    ("pair_mid2_color_score", "selection_pair_mid2_score_distributions.png", "Selected Pair-Mid2 Score Distributions"),
-]:
-    if column not in meta_all.columns:
-        fallback = "full_color_score" if column == "local_full_color_score" else column
-        column_to_plot = fallback if fallback in meta_all.columns else None
-    else:
-        column_to_plot = column
-    plt.figure(figsize=(8, 5))
-    if column_to_plot:
-        for run_id, frame in meta_all.groupby("run_id"):
-            values = frame[column_to_plot].dropna().to_numpy()
-            plt.hist(values, bins=60, alpha=0.35, density=True, label=run_labels.get(run_id, run_id))
-        plt.xlabel(column_to_plot)
-        plt.ylabel("Density")
-        plt.legend(fontsize=8)
-    else:
-        plt.text(0.5, 0.5, f"Missing column {column}", ha="center", va="center")
-    plt.title(title)
-    plt.grid(alpha=0.2)
-    savefig(FIGURES_DRIVE / filename)
-
-matrix = pd.DataFrame(np.eye(len(production_order)), index=production_order, columns=production_order)
-for _, row in overlap.iterrows():
-    left = row["left_run_id"]
-    right = row["right_run_id"]
-    value = row.get("seq_idx_jaccard", np.nan)
-    matrix.loc[left, right] = value
-    matrix.loc[right, left] = value
-plt.figure(figsize=(7, 6))
-image = plt.imshow(matrix.loc[production_order, production_order], vmin=0, vmax=1, cmap="viridis")
-plt.colorbar(image, label="Seq idx Jaccard")
-plt.xticks(range(len(production_order)), [run_labels[r] for r in production_order], rotation=35, ha="right", fontsize=8)
-plt.yticks(range(len(production_order)), [run_labels[r] for r in production_order], fontsize=8)
-for i in range(len(production_order)):
-    for j in range(len(production_order)):
-        value = matrix.iloc[i, j]
-        plt.text(j, i, f"{value:.2f}", ha="center", va="center", color="white" if value < 0.5 else "black", fontsize=8)
-plt.title("Selected Set Overlap")
-savefig(FIGURES_DRIVE / "selected_set_overlap_heatmap.png")
-```
-
-Safe to rerun. Build a Markdown and HTML report on Drive:
-
-```python
-# PYTHON CELL
-import html
-import json
-import pandas as pd
-
-def md_table(frame: pd.DataFrame, columns=None, floatfmt=".4f") -> str:
-    if columns is not None:
-        frame = frame[columns].copy()
-    if frame.empty:
-        return "_No rows._"
-    cols = list(frame.columns)
-    lines = ["| " + " | ".join(cols) + " |", "| " + " | ".join(["---"] * len(cols)) + " |"]
-    for _, row in frame.iterrows():
-        vals = []
-        for col in cols:
-            value = row[col]
-            if isinstance(value, float):
-                vals.append(format(value, floatfmt))
-            else:
-                vals.append(str(value))
-        lines.append("| " + " | ".join(vals) + " |")
-    return "\n".join(lines)
-
-final_train = (
-    train_metrics.sort_values(["run_id", "step"])
-    .groupby("run_id")
-    .tail(1)
-    .reset_index(drop=True)
-) if len(train_metrics) else pd.DataFrame()
-
-eval_summary = pd.DataFrame()
-if len(eval_metrics_long):
-    eval_ce = eval_metrics_long[eval_metrics_long["metric"] == "CrossEntropyLoss"]
-    eval_summary = (
-        eval_ce.sort_values(["run_id", "label", "step"])
-        .groupby(["run_id", "label"])
-        .tail(1)
-        .pivot(index="run_id", columns="label", values="value")
-        .reset_index()
-    )
-
-manifest = json.loads(EVAL_MANIFEST.read_text())
-
-report = []
-report.append("# 410M Score-Pool Mini-Universe Training Report")
-report.append("")
-report.append("## Executive Summary")
-report.append("")
-report.append("This report compares four 410M-class OLMo-style models trained for two passes over matched 100K-row score-pool mini-universe selections. All production configs use the same architecture, seed, optimizer, scheduler, tokenizer, batch size, sequence length, and eval schedule; they differ only in the selected training data.")
-report.append("")
-report.append("## Data Provenance")
-report.append("")
-report.append(f"- Training data: `{TRAIN_DATA_DRIVE}`")
-report.append(f"- Eval data: `{EVAL_DATA_DRIVE}`")
-report.append(f"- Books eval source: `{manifest['books_val']['source']}`")
-report.append(f"- C4 eval source: `{manifest['c4_val_proxy']['source']}`")
-report.append(f"- C4 caveat: {manifest['c4_val_proxy']['note']}")
-report.append("")
-report.append("## Selection Diagnostics")
-report.append("")
-report.append(md_table(selection, ["run_id", "selected_rows", "true_positive_count", "true_positive_rate", "oracle_positive_recall"]))
-report.append("")
-report.append("## Final Training Metrics")
-report.append("")
-if len(final_train):
-    report.append(md_table(final_train, ["run_id", "step", "train_cross_entropy", "train_perplexity", "tokens_per_second", "peak_gpu_memory_mb"]))
-else:
-    report.append("_No training metrics parsed._")
-report.append("")
-report.append("## Final Eval Metrics")
-report.append("")
-if len(eval_summary):
-    report.append(md_table(eval_summary))
-else:
-    report.append("_No eval metrics parsed._")
-report.append("")
-report.append("## Figures")
-report.append("")
-for filename, caption in [
-    ("train_loss_by_run.png", "Training cross entropy over optimizer steps."),
-    ("eval_loss_books_by_run.png", "Books validation cross entropy over optimizer steps."),
-    ("eval_loss_c4_by_run.png", "C4 validation proxy cross entropy over optimizer steps."),
-    ("tokens_per_second_by_run.png", "Device tokens per second over optimizer steps."),
-    ("selection_full_score_distributions.png", "Distribution of selected full CoLoR scores."),
-    ("selection_pair_mid2_score_distributions.png", "Distribution of selected pair-mid2 CoLoR scores."),
-    ("selected_set_overlap_heatmap.png", "Jaccard overlap between selected training sets."),
-]:
-    report.append(f"![{caption}](figures/{filename})")
-    report.append("")
-report.append("## Reproducibility Appendix")
-report.append("")
-report.append(f"- CoLoR-ablation SHA: `{ABLATION_SHA}`")
-report.append(f"- color-filter-olmo SHA: `{OLMO_SHA}`")
-report.append(f"- Runtime config dir: `{RUNTIME_CONFIG_DIR}`")
-report.append(f"- Checkpoints: `{CHECKPOINTS_DRIVE}`")
-report.append(f"- Results: `{RESULTS_DRIVE}`")
-report.append(f"- Reports: `{REPORTS_DRIVE}`")
-report.append(f"- Sequence length: `{SEQ_LEN}`")
-report.append(f"- Eval subset batches: `{EVAL_SUBSET_NUM_BATCHES}`")
-report.append(f"- Device eval batch size: `{DEVICE_EVAL_BATCH_SIZE}`")
-report.append("")
-report.append("## Limitations")
-report.append("")
-report.append("- This is a single-seed pilot.")
-report.append("- The C4 metric is a fixed public validation proxy because the original CoLoR-Filter downstream data exposes Books validation but not a C4 validation memmap.")
-report.append("- The model is 410M-class by non-embedding parameters and is not a 1.2B reproduction.")
-
-report_md = REPORTS_DRIVE / "report.md"
-report_md.write_text("\n".join(report), encoding="utf-8")
-print("wrote:", report_md, report_md.stat().st_size)
-
-try:
-    import markdown
-    body = markdown.markdown(report_md.read_text(encoding="utf-8"), extensions=["tables"])
-except Exception:
-    body = "<pre>" + html.escape(report_md.read_text(encoding="utf-8")) + "</pre>"
-
-report_html = REPORTS_DRIVE / "report.html"
-report_html.write_text("<html><body>" + body + "</body></html>", encoding="utf-8")
-print("wrote:", report_html, report_html.stat().st_size)
+display(pd.read_csv(RESULTS_DRIVE / "selection_diagnostics.csv"))
+display(pd.read_csv(RESULTS_DRIVE / "throughput_comparison.csv"))
+print("report:", REPORTS_DRIVE / "report.md")
+print("html:", REPORTS_DRIVE / "report.html")
+print("figures:", sorted(p.name for p in FIGURES_DRIVE.glob("*.png")))
 ```
 
 ## 10. Outputs To Bring Back Locally
@@ -1262,9 +950,9 @@ print("wrote:", report_html, report_html.stat().st_size)
 The durable outputs are under:
 
 ```text
-MyDrive/color-filter-ablation/results/train-410m-score-pool-mini-universes
-MyDrive/color-filter-ablation/reports/train-410m-score-pool-mini-universes
-MyDrive/color-filter-ablation/checkpoints/train-410m-score-pool-mini-universes
+MyDrive/color-filter-ablation/results/train-410m-score-pool-mini-universes-2ep
+MyDrive/color-filter-ablation/reports/train-410m-score-pool-mini-universes-2ep
+MyDrive/color-filter-ablation/checkpoints/train-410m-score-pool-mini-universes-2ep
 ```
 
 The required report figures are:
@@ -1281,61 +969,15 @@ figures/selected_set_overlap_heatmap.png
 
 ## 11. Output Review And Acceptance Checks
 
-Safe to rerun. Run this after Section 9:
+Safe to rerun. Run this after Section 9. It verifies the metrics CSVs, report
+files, all required figures, final eval curves, final step780 checkpoints, and
+100K-row selection diagnostics.
 
 ```python
 # PYTHON CELL
-import json
-import pandas as pd
+import subprocess
 
-required_artifacts = [
-    RESULTS_DRIVE / "train_metrics_from_logs.csv",
-    RESULTS_DRIVE / "eval_metrics_from_logs.csv",
-    RESULTS_DRIVE / "throughput_comparison.csv",
-    RESULTS_DRIVE / "selection_diagnostics.csv",
-    RESULTS_DRIVE / "overlap_jaccard.csv",
-    RESULTS_DRIVE / "checkpoint_manifest.json",
-    REPORTS_DRIVE / "report.md",
-    REPORTS_DRIVE / "report.html",
-]
-required_figures = [
-    FIGURES_DRIVE / "train_loss_by_run.png",
-    FIGURES_DRIVE / "eval_loss_books_by_run.png",
-    FIGURES_DRIVE / "eval_loss_c4_by_run.png",
-    FIGURES_DRIVE / "tokens_per_second_by_run.png",
-    FIGURES_DRIVE / "selection_full_score_distributions.png",
-    FIGURES_DRIVE / "selection_pair_mid2_score_distributions.png",
-    FIGURES_DRIVE / "selected_set_overlap_heatmap.png",
-]
-
-for path in required_artifacts + required_figures:
-    assert path.exists(), path
-    assert path.stat().st_size > 0, path
-    print("artifact ok:", path, path.stat().st_size)
-
-selection_check = pd.read_csv(RESULTS_DRIVE / "selection_diagnostics.csv")
-assert len(selection_check) == 4
-assert set(selection_check["run_id"]) == set(production_order)
-assert (selection_check["selected_rows"] == 100_000).all()
-print(selection_check[["run_id", "true_positive_count", "true_positive_rate"]])
-
-train_check = pd.read_csv(RESULTS_DRIVE / "train_metrics_from_logs.csv")
-assert set(train_check["run_id"]) == set(production_order), train_check["run_id"].unique()
-final_steps = train_check.groupby("run_id")["step"].max()
-assert (final_steps == 780).all(), final_steps
-print(train_check.sort_values(["run_id", "step"]).groupby("run_id").tail(1))
-
-eval_check = pd.read_csv(RESULTS_DRIVE / "eval_metrics_from_logs.csv")
-assert {"books_val", "c4_val_proxy"}.issubset(set(eval_check["label"])), eval_check["label"].unique()
-assert {"CrossEntropyLoss", "Perplexity"}.issubset(set(eval_check["metric"])), eval_check["metric"].unique()
-final_eval_steps = eval_check[eval_check["metric"] == "CrossEntropyLoss"].groupby(["run_id", "label"])["step"].max()
-assert (final_eval_steps == 780).all(), final_eval_steps
-print(eval_check[eval_check["metric"] == "CrossEntropyLoss"].sort_values(["run_id", "label", "step"]).groupby(["run_id", "label"]).tail(1))
-
-manifest = json.loads((RESULTS_DRIVE / "checkpoint_manifest.json").read_text())
-for run_id in production_order:
-    assert manifest["runs"][run_id]["has_final_step780"], manifest["runs"][run_id]
-print("acceptance checks passed")
+subprocess.run(build_report_cmd(check_only=True), cwd=OLMO_DIR, check=True)
 ```
 
 ## 12. Stop Rules And Interpretation
