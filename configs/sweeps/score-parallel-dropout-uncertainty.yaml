@@ -19,8 +19,12 @@ device_train_microbatch_size: 256
 restore_dataloader: false
 reset_optimizer_state: true
 reset_trainer_state: true
+precision: amp_bf16
 seed: 1
 data_start_step: 0
+
+fsdp:
+  precision: mixed
 
 data:
   paths: null
