@@ -1,4 +1,6 @@
-# Template for MC-dropout CoLoR scoring.
+# Runtime overlay template for MC-dropout CoLoR scoring.
+# The Colab notebook merges this with each checkpoint's config.yaml so the
+# model architecture matches the state dict before restoring weights.
 #
 # Colab/runtime code should patch:
 # - run_name
