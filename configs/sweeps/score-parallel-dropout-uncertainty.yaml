@@ -1,0 +1,50 @@
+# Template for MC-dropout CoLoR scoring.
+#
+# Colab/runtime code should patch:
+# - run_name
+# - save_folder
+# - data.paths
+# - load_path
+# - max_duration / data_start_step for the selected shard
+# - dropout rate and num_samples for the experiment grid
+
+just_score_model: true
+run_name: dropout_uncertainty_score_template
+save_folder: outputs/dropout-uncertainty-template
+load_path: prior
+load_checkpoint_type: unsharded
+max_duration: 192000
+global_train_batch_size: 256
+device_train_microbatch_size: 256
+restore_dataloader: false
+reset_optimizer_state: true
+reset_trainer_state: true
+seed: 1
+data_start_step: 0
+
+data:
+  paths: null
+  drop_last: true
+  memmap_dtype: uint16
+
+model:
+  attention_dropout: 0.05
+  residual_dropout: 0.05
+  embedding_dropout: 0.05
+
+uncertainty_scoring:
+  enabled: true
+  num_samples: 8
+  perturbation_type: dropout
+  selection_metric: lcb
+  lcb_alpha: 1.0
+  coupled_masks: true
+  activation_noise_std: 0.01
+
+sweep:
+  - load_path:
+      - prior
+      - conditional_books
+    load_checkpoint_type: unsharded
+    data_start_step:
+      - 0
