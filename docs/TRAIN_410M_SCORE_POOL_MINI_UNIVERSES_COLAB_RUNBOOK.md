@@ -16,7 +16,10 @@ The six production runs are:
 6. `hard_union_control_100k`
 
 The two union controls are P2 controls: each samples 100K rows from its matched
-positive/negative mini-universe without using CoLoR ranking.
+positive/negative mini-universe without using CoLoR ranking. Optional hard-source
+seed repeats can also be generated for `hard_positive_oracle_100k` and
+`hard_pair_cascade_100k`; these reuse the base selected data and vary only the
+training seed plus log/checkpoint identity.
 
 The checked-in base sweep configs are used as templates. The Colab runtime
 generates production configs with local Drive paths and explicit Books/C4 LM
@@ -91,6 +94,7 @@ optimizer steps per run:       780
 tokens per run:                102,236,160
 P0 optimizer steps total:      3,120
 all six optimizer steps total: 4,680
+each optional seed-repeat run: 780
 ```
 
 Production evals run every 78 optimizer steps so the curves include the final
@@ -546,6 +550,34 @@ for run_id, template_path in config_map.items():
     print("wrote:", out_path)
 ```
 
+Optional hard-source seed repeats. Edit `HARD_SOURCE_REPEAT_SEEDS` to add or
+remove training seeds; set it to `[]` to train only the six base runs.
+
+```python
+# PYTHON CELL
+HARD_SOURCE_REPEAT_SEEDS = [18, 19]
+HARD_SOURCE_SEED_BASE_RUNS = [
+    "hard_positive_oracle_100k",
+    "hard_pair_cascade_100k",
+]
+
+hard_source_seed_run_ids = []
+for seed in HARD_SOURCE_REPEAT_SEEDS:
+    for base_run_id in HARD_SOURCE_SEED_BASE_RUNS:
+        run_id = base_run_id.removesuffix("_100k") + f"_seed{seed}_100k"
+        cfg = OmegaConf.load(runtime_config_map[base_run_id])
+        cfg.seed = seed
+        cfg.run_name = f"{cfg.run_name}_seed{seed}"
+        cfg.save_folder = str(CHECKPOINTS_DRIVE / run_id)
+        out_path = RUNTIME_CONFIG_DIR / f"{run_id}.yaml"
+        OmegaConf.save(cfg, out_path)
+        runtime_config_map[run_id] = out_path
+        hard_source_seed_run_ids.append(run_id)
+        print("wrote:", out_path, "data:", cfg.data.paths[0], "seed:", cfg.seed)
+
+print("hard-source seed repeats:", hard_source_seed_run_ids)
+```
+
 Safe to rerun. Load generated configs through OLMo and print parameter count:
 
 ```python
@@ -637,8 +669,10 @@ SMOKE_CONFIG_DIR = Path("/content/score_pool_410m_smoke_configs")
 SMOKE_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 SMOKE_DIR.mkdir(parents=True, exist_ok=True)
 
+smoke_run_ids = list(config_map)
 smoke_config_map = {}
-for run_id, prod_cfg_path in runtime_config_map.items():
+for run_id in smoke_run_ids:
+    prod_cfg_path = runtime_config_map[run_id]
     cfg = OmegaConf.load(prod_cfg_path)
     cfg.run_name = f"smoke_{run_id}"
     cfg.save_folder = str(SMOKE_DIR / run_id)
@@ -680,7 +714,7 @@ required_smoke_markers = [
     "eval/c4_val_proxy/CrossEntropyLoss",
     "Training complete",
 ]
-for run_id in runs:
+for run_id in smoke_config_map:
     log_path = SMOKE_DIR / f"{run_id}.log"
     text = log_path.read_text(errors="ignore")
     missing = [marker for marker in required_smoke_markers if marker not in text]
@@ -827,15 +861,15 @@ print("MICROBATCH:", MICROBATCH)
 
 ## 7. Full Resumable Training Runs
 
-Full run. Train all six models under the fresh eval-enabled experiment
-directory. The helper skips only logs that contain `Training complete`
-and the expected eval curves. If interrupted before completion, it appends to
-the existing log and resumes from the latest checkpoint so partial learning
-curves are preserved.
+Full run. Train all six base models plus any configured hard-source seed repeats
+under the fresh eval-enabled experiment directory. The helper skips only logs
+that contain `Training complete` and the expected eval curves. If interrupted
+before completion, it appends to the existing log and resumes from the latest
+checkpoint so partial learning curves are preserved.
 
 ```python
 # PYTHON CELL
-production_order = [
+base_production_order = [
     "random_positive_oracle_100k",
     "random_pair_cascade_100k",
     "random_union_control_100k",
@@ -843,6 +877,8 @@ production_order = [
     "hard_pair_cascade_100k",
     "hard_union_control_100k",
 ]
+production_order = base_production_order + list(globals().get("hard_source_seed_run_ids", []))
+print("production order:", production_order)
 
 EXPECTED_EVAL_POINTS = 10
 
@@ -934,11 +970,13 @@ for run_id in production_order:
         print("checkpoint dir missing")
 ```
 
-Resume one run:
+Resume one run. Set `RUN_TO_RESUME` to any configured run ID printed in Section 7:
 
 ```python
 # PYTHON CELL
-RUN_TO_RESUME = "random_pair_cascade_100k"
+RUN_TO_RESUME = "hard_pair_cascade_seed18_100k"
+if RUN_TO_RESUME not in runtime_config_map:
+    raise KeyError(f"{RUN_TO_RESUME} is not configured. Available runs: {list(runtime_config_map)}")
 run_training(RUN_TO_RESUME)
 ```
 
@@ -953,14 +991,14 @@ all artifacts directly to Drive.
 # PYTHON CELL
 import subprocess
 
-report_run_ids = globals().get("production_order", [
+report_run_ids = list(globals().get("production_order", [
     "random_positive_oracle_100k",
     "random_pair_cascade_100k",
     "random_union_control_100k",
     "hard_positive_oracle_100k",
     "hard_pair_cascade_100k",
     "hard_union_control_100k",
-])
+]))
 
 def build_report_cmd(check_only: bool = False) -> list[str]:
     cmd = [
@@ -980,6 +1018,8 @@ def build_report_cmd(check_only: bool = False) -> list[str]:
         "--eval-interval", "78",
         "--device-eval-batch-size", str(DEVICE_EVAL_BATCH_SIZE),
     ]
+    for run_id in report_run_ids:
+        cmd.extend(["--run-id", run_id])
     if check_only:
         cmd.append("--check-only")
     return cmd
@@ -1046,6 +1086,7 @@ The required report figures are:
 ```text
 figures/train_loss_by_run.png
 figures/eval_loss_books_by_run.png
+figures/eval_loss_books_hard_oracle_vs_cascade_seeds.png
 figures/eval_loss_c4_by_run.png
 figures/tokens_per_second_by_run.png
 figures/selection_full_score_distributions.png

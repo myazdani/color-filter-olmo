@@ -51,6 +51,11 @@ RUN_GROUPS = {
     },
 }
 
+HARD_SEED_PAIR_BASE_RUN_IDS = (
+    "hard_positive_oracle_100k",
+    "hard_pair_cascade_100k",
+)
+
 FIGURES = (
     "train_loss_by_run.png",
     "train_loss_random_source.png",
@@ -58,6 +63,7 @@ FIGURES = (
     "eval_loss_books_by_run.png",
     "eval_loss_books_random_source.png",
     "eval_loss_books_hard_source.png",
+    "eval_loss_books_hard_oracle_vs_cascade_seeds.png",
     "eval_loss_c4_by_run.png",
     "eval_loss_c4_random_source.png",
     "eval_loss_c4_hard_source.png",
@@ -70,6 +76,39 @@ FIGURES = (
     "selected_set_overlap_random_source.png",
     "selected_set_overlap_hard_source.png",
 )
+
+
+def run_seed(run_id: str) -> int | None:
+    match = re.match(r"^(.+)_seed(\d+)_100k$", run_id)
+    return int(match.group(2)) if match else None
+
+
+def base_run_id(run_id: str) -> str:
+    match = re.match(r"^(.+)_seed\d+_100k$", run_id)
+    return f"{match.group(1)}_100k" if match else run_id
+
+
+def run_label(run_id: str) -> str:
+    seed = run_seed(run_id)
+    label = RUN_LABELS.get(base_run_id(run_id), run_id)
+    return f"{label} seed {seed}" if seed is not None else label
+
+
+def dynamic_run_groups(run_ids: Iterable[str]) -> dict[str, dict[str, object]]:
+    run_ids = list(run_ids)
+    groups: dict[str, dict[str, object]] = {}
+    for group_name, group in RUN_GROUPS.items():
+        base_ids = set(group["run_ids"])
+        groups[group_name] = {
+            "title": group["title"],
+            "run_ids": tuple(run_id for run_id in run_ids if base_run_id(run_id) in base_ids),
+        }
+    return groups
+
+
+def hard_seed_pair_run_ids(run_ids: Iterable[str]) -> tuple[str, ...]:
+    base_ids = set(HARD_SEED_PAIR_BASE_RUN_IDS)
+    return tuple(run_id for run_id in run_ids if base_run_id(run_id) in base_ids)
 
 
 def parse_number(value: str) -> float:
@@ -203,8 +242,18 @@ def load_meta_frames(
 ) -> pd.DataFrame:
     frames = []
     for run_id in run_ids:
-        parquet_path = train_data_dir / run_id / "train_meta.parquet"
-        csv_path = train_data_dir / run_id / "train_meta.csv"
+        data_run_id = run_id
+        parquet_path = train_data_dir / data_run_id / "train_meta.parquet"
+        csv_path = train_data_dir / data_run_id / "train_meta.csv"
+        if not parquet_path.exists() and not csv_path.exists():
+            candidate = base_run_id(run_id)
+            if candidate != run_id:
+                candidate_parquet = train_data_dir / candidate / "train_meta.parquet"
+                candidate_csv = train_data_dir / candidate / "train_meta.csv"
+                if candidate_parquet.exists() or candidate_csv.exists():
+                    data_run_id = candidate
+                    parquet_path = candidate_parquet
+                    csv_path = candidate_csv
         if parquet_path.exists():
             frame = pd.read_parquet(parquet_path)
         elif csv_path.exists():
@@ -215,10 +264,54 @@ def load_meta_frames(
                 continue
             raise FileNotFoundError(parquet_path)
         frame["run_id"] = run_id
+        frame["selection_source_run_id"] = data_run_id
         frames.append(frame)
     if not frames:
         return pd.DataFrame()
     return pd.concat(frames, ignore_index=True)
+
+
+def expand_selection_for_run_ids(selection: pd.DataFrame, run_ids: Iterable[str]) -> pd.DataFrame:
+    if selection.empty or "run_id" not in selection.columns:
+        return selection
+    rows: list[pd.Series] = []
+    selection_by_run = {str(row["run_id"]): row for _, row in selection.iterrows()}
+    for run_id in run_ids:
+        source_run_id = run_id if run_id in selection_by_run else base_run_id(run_id)
+        if source_run_id not in selection_by_run:
+            continue
+        row = selection_by_run[source_run_id].copy()
+        row["run_id"] = run_id
+        row["selection_source_run_id"] = source_run_id
+        rows.append(row)
+    return pd.DataFrame(rows).reset_index(drop=True) if rows else selection.iloc[0:0].copy()
+
+
+def overlap_from_meta(meta_all: pd.DataFrame) -> pd.DataFrame:
+    if meta_all.empty or "seq_idx" not in meta_all.columns or "run_id" not in meta_all.columns:
+        return pd.DataFrame()
+    run_order = list(dict.fromkeys(meta_all["run_id"].astype(str)))
+    selected = {
+        run_id: set(frame["seq_idx"].dropna().astype(int).tolist())
+        for run_id, frame in meta_all.groupby("run_id", sort=False)
+    }
+    rows: list[dict[str, object]] = []
+    for left_index, left_run_id in enumerate(run_order):
+        for right_run_id in run_order[left_index + 1 :]:
+            left = selected[left_run_id]
+            right = selected[right_run_id]
+            union_count = len(left | right)
+            intersection_count = len(left & right)
+            rows.append(
+                {
+                    "left_run_id": left_run_id,
+                    "right_run_id": right_run_id,
+                    "seq_idx_intersection": intersection_count,
+                    "seq_idx_union": union_count,
+                    "seq_idx_jaccard": intersection_count / union_count if union_count else math.nan,
+                }
+            )
+    return pd.DataFrame(rows)
 
 
 def savefig(path: Path) -> None:
@@ -235,7 +328,7 @@ def add_variant_label(frame: pd.DataFrame) -> pd.DataFrame:
     if frame.empty or "run_id" not in frame.columns:
         return frame
     labelled = frame.copy()
-    labelled.insert(1, "variant", labelled["run_id"].map(RUN_LABELS).fillna(labelled["run_id"]))
+    labelled.insert(1, "variant", labelled["run_id"].map(run_label))
     return labelled
 
 
@@ -257,14 +350,14 @@ def label_overlap_frame(frame: pd.DataFrame, run_ids: Iterable[str]) -> pd.DataF
         labelled.insert(
             labelled.columns.get_loc("left_run_id") + 1,
             "left_variant",
-            labelled["left_run_id"].map(RUN_LABELS).fillna(labelled["left_run_id"]),
+            labelled["left_run_id"].map(run_label),
         )
         labelled["_left_order"] = labelled["left_run_id"].map(order).fillna(len(order))
     if "right_run_id" in labelled.columns:
         labelled.insert(
             labelled.columns.get_loc("right_run_id") + 1,
             "right_variant",
-            labelled["right_run_id"].map(RUN_LABELS).fillna(labelled["right_run_id"]),
+            labelled["right_run_id"].map(run_label),
         )
         labelled["_right_order"] = labelled["right_run_id"].map(order).fillna(len(order))
     sort_columns = [col for col in ["_left_order", "_right_order"] if col in labelled.columns]
@@ -287,6 +380,7 @@ def generate_figures(
 
     figures_dir = reports_dir / "figures"
     plt.style.use("default")
+    run_groups = dynamic_run_groups(run_ids)
 
     def plot_metric_lines(
         frame: pd.DataFrame,
@@ -308,7 +402,7 @@ def generate_figures(
                 group[y_column],
                 marker="o",
                 linewidth=1.5,
-                label=RUN_LABELS.get(run_id, run_id),
+                label=run_label(run_id),
             )
             plotted = True
         plt.xlabel("Optimizer step")
@@ -337,7 +431,7 @@ def generate_figures(
             title=f"{title_metric} By Run",
             ylabel=ylabel,
         )
-        for suffix, group in RUN_GROUPS.items():
+        for suffix, group in run_groups.items():
             plot_metric_lines(
                 frame,
                 run_subset=group["run_ids"],
@@ -390,6 +484,15 @@ def generate_figures(
             title_metric=title_metric,
             ylabel="Eval cross entropy",
         )
+        if label == "books_val":
+            plot_metric_lines(
+                frame,
+                run_subset=hard_seed_pair_run_ids(run_ids),
+                y_column="value",
+                filename="eval_loss_books_hard_oracle_vs_cascade_seeds.png",
+                title="Hard Source Books Validation Loss: Oracle vs Cascade Seeds",
+                ylabel="Eval cross entropy",
+            )
 
     meta_all = load_meta_frames(train_data_dir, run_ids, allow_missing=allow_log_only_runs)
     for column, filename, title in [
@@ -405,7 +508,7 @@ def generate_figures(
         if column_to_plot and not meta_all.empty:
             for run_id, frame in meta_all.groupby("run_id"):
                 values = frame[column_to_plot].dropna().to_numpy()
-                plt.hist(values, bins=60, alpha=0.35, density=True, label=RUN_LABELS.get(run_id, run_id))
+                plt.hist(values, bins=60, alpha=0.35, density=True, label=run_label(run_id))
             plt.xlabel(column_to_plot)
             plt.ylabel("Density")
             plt.legend(fontsize=8)
@@ -445,12 +548,12 @@ def generate_figures(
         plt.colorbar(image, label="Jaccard overlap")
         plt.xticks(
             range(len(selected_run_ids)),
-            [RUN_LABELS.get(r, r) for r in selected_run_ids],
+            [run_label(r) for r in selected_run_ids],
             rotation=35,
             ha="right",
             fontsize=8,
         )
-        plt.yticks(range(len(selected_run_ids)), [RUN_LABELS.get(r, r) for r in selected_run_ids], fontsize=8)
+        plt.yticks(range(len(selected_run_ids)), [run_label(r) for r in selected_run_ids], fontsize=8)
         for i in range(len(selected_run_ids)):
             for j in range(len(selected_run_ids)):
                 value = matrix.iloc[i, j]
@@ -468,12 +571,12 @@ def generate_figures(
 
     plot_overlap_heatmap(run_ids, "selected_set_overlap_heatmap.png", "Selected Set Overlap Matrix")
     plot_overlap_heatmap(
-        RUN_GROUPS["random_source"]["run_ids"],
+        run_groups["random_source"]["run_ids"],
         "selected_set_overlap_random_source.png",
         "Random-source Selected Set Overlap",
     )
     plot_overlap_heatmap(
-        RUN_GROUPS["hard_source"]["run_ids"],
+        run_groups["hard_source"]["run_ids"],
         "selected_set_overlap_hard_source.png",
         "Hard-source Selected Set Overlap",
     )
@@ -540,16 +643,33 @@ def write_report(
 
     manifest = json.loads(eval_manifest_path.read_text())
     run_count_word = {4: "four", 5: "five", 6: "six"}.get(len(run_ids), str(len(run_ids)))
+    run_groups = dynamic_run_groups(run_ids)
+    seed_repeat_values = sorted({seed for seed in (run_seed(run_id) for run_id in run_ids) if seed is not None})
+    has_seed_repeats = bool(seed_repeat_values)
+    seed_line = (
+        "- Training seeds: base runs use `17`; hard-source repeat runs use "
+        f"`{', '.join(str(seed) for seed in seed_repeat_values)}`."
+        if has_seed_repeats
+        else "- Training seed: `17`."
+    )
+    setup_summary = (
+        "same architecture, optimizer, scheduler, tokenizer, batch size, sequence length, "
+        "and eval schedule. Seed-repeat runs intentionally vary only the training seed while "
+        "reusing the matching base selected training data."
+        if has_seed_repeats
+        else "same architecture, seed, optimizer, scheduler, tokenizer, batch size, sequence length, "
+        "and eval schedule; they differ only in the selected training data."
+    )
     selection = add_variant_label(sort_by_run_order(selection, run_ids))
     sensitivity = add_variant_label(sort_by_run_order(sensitivity, run_ids))
     overlap = label_overlap_frame(overlap, run_ids)
     random_overlap = overlap[
-        overlap["left_run_id"].isin(RUN_GROUPS["random_source"]["run_ids"])
-        & overlap["right_run_id"].isin(RUN_GROUPS["random_source"]["run_ids"])
+        overlap["left_run_id"].isin(run_groups["random_source"]["run_ids"])
+        & overlap["right_run_id"].isin(run_groups["random_source"]["run_ids"])
     ].reset_index(drop=True)
     hard_overlap = overlap[
-        overlap["left_run_id"].isin(RUN_GROUPS["hard_source"]["run_ids"])
-        & overlap["right_run_id"].isin(RUN_GROUPS["hard_source"]["run_ids"])
+        overlap["left_run_id"].isin(run_groups["hard_source"]["run_ids"])
+        & overlap["right_run_id"].isin(run_groups["hard_source"]["run_ids"])
     ].reset_index(drop=True)
     selection_run_ids = set(selection["run_id"]) if "run_id" in selection.columns else set()
     missing_selection_run_ids = [run_id for run_id in run_ids if run_id not in selection_run_ids]
@@ -562,8 +682,7 @@ def write_report(
         (
             f"This report compares {run_count_word} 410M-class OLMo-style models trained for two passes over "
             "matched 100K-row score-pool mini-universe selections. All production configs use the "
-            "same architecture, seed, optimizer, scheduler, tokenizer, batch size, sequence length, "
-            "and eval schedule; they differ only in the selected training data."
+            f"{setup_summary}"
         ),
         "",
         "## Data Provenance",
@@ -594,6 +713,16 @@ def write_report(
             "- `hard_union_control_100k` (Hard PN mixture control): random 100K rows "
             "from `hard_positive union hard_negative`."
         ),
+        *(
+            [
+                (
+                    "- Seed-repeat run IDs such as `hard_pair_cascade_seed18_100k` reuse the matching "
+                    "base 100K training selection and vary only the training seed/log/checkpoint identity."
+                )
+            ]
+            if has_seed_repeats
+            else []
+        ),
         "- PN means the positive/negative source-pool union for that source family.",
         "- Cascade multiplier for trained cascade runs: `m = 1.5`.",
         "- Score convention: `conditional_books_loss - prior_loss`; lower is better.",
@@ -603,7 +732,7 @@ def write_report(
         "- Total parameters: `522,097,920`.",
         "- Non-embedding parameters: `393,319,680`.",
         "- Architecture: `d_model=1280`, `n_layers=20`, `n_heads=20`, sequence length `512`.",
-        "- Seed: `17`.",
+        seed_line,
         "- Global train batch size: `256` sequences.",
         "- Training duration: `2ep`, which is `780` optimizer steps for each 100K-row memmap.",
         "- Eval interval: every `78` optimizer steps, including final step `780`.",
@@ -728,6 +857,10 @@ def write_report(
         ("train_loss_hard_source.png", "Hard-source training cross entropy over optimizer steps."),
         ("eval_loss_books_random_source.png", "Random-source Books validation cross entropy over optimizer steps."),
         ("eval_loss_books_hard_source.png", "Hard-source Books validation cross entropy over optimizer steps."),
+        (
+            "eval_loss_books_hard_oracle_vs_cascade_seeds.png",
+            "Hard-source Books validation cross entropy for oracle and cascade seed repeats.",
+        ),
         ("eval_loss_c4_random_source.png", "Random-source C4 validation proxy cross entropy over optimizer steps."),
         ("eval_loss_c4_hard_source.png", "Hard-source C4 validation proxy cross entropy over optimizer steps."),
         ("tokens_per_second_random_source.png", "Random-source device tokens per second over optimizer steps."),
@@ -754,7 +887,11 @@ def write_report(
             "",
             "## Limitations",
             "",
-            "- This is a single-seed pilot.",
+            (
+                "- Seed-repeat coverage is limited to the hard positive-only baseline and hard PN cascade."
+                if has_seed_repeats
+                else "- This is a single-seed pilot."
+            ),
             (
                 "- The C4 metric is a fixed public validation proxy because the original CoLoR-Filter "
                 "downstream data exposes Books validation but not a C4 validation memmap."
@@ -808,8 +945,18 @@ def write_metrics_and_report(args: argparse.Namespace) -> None:
         )
     throughput.to_csv(args.results_dir / "throughput_comparison.csv", index=False)
 
-    selection = pd.read_csv(args.train_data_dir / "selection_diagnostics.csv")
-    overlap = pd.read_csv(args.train_data_dir / "overlap_jaccard.csv")
+    selection = expand_selection_for_run_ids(
+        pd.read_csv(args.train_data_dir / "selection_diagnostics.csv"),
+        run_ids,
+    )
+    meta_for_overlap = load_meta_frames(
+        args.train_data_dir,
+        run_ids,
+        allow_missing=args.allow_log_only_runs,
+    )
+    overlap = overlap_from_meta(meta_for_overlap)
+    if overlap.empty:
+        overlap = pd.read_csv(args.train_data_dir / "overlap_jaccard.csv")
     sensitivity_path = args.train_data_dir / "selection_sensitivity.csv"
     sensitivity = pd.read_csv(sensitivity_path) if sensitivity_path.exists() else pd.DataFrame()
     selection.to_csv(args.results_dir / "selection_diagnostics.csv", index=False)
