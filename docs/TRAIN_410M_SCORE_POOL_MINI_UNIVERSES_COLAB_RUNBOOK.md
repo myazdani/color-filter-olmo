@@ -279,6 +279,7 @@ import subprocess
 
 required_paths = [
     Path("/content/CoLoR-ablation/scripts/18_build_score_pool_training_sets.py"),
+    Path("/content/CoLoR-ablation/scripts/21_ensure_score_pool_training_sets.py"),
     Path("/content/color-filter-olmo/scripts/train.py"),
     Path("/content/color-filter-olmo/scripts/score_pool_410m_report.py"),
     Path("/content/color-filter-olmo/configs/sweeps/score-pool-410m-100m-random-positive-oracle.yaml"),
@@ -293,24 +294,35 @@ for path in required_paths:
         raise FileNotFoundError(path)
     print("ok:", path)
 
-subprocess.run([
-    "python",
-    "-m",
-    "py_compile",
-    "/content/color-filter-olmo/scripts/score_pool_410m_report.py",
-], check=True)
-print("report helper compiles")
+for script in [
+    Path("/content/CoLoR-ablation/scripts/21_ensure_score_pool_training_sets.py"),
+    Path("/content/color-filter-olmo/scripts/score_pool_410m_report.py"),
+]:
+    subprocess.run(["python", "-m", "py_compile", str(script)], check=True)
+print("helpers compile")
 ```
 
 ## 3. Prepare Train And Eval Data
 
-Safe to rerun. Copy small training memmaps from Drive to local scratch. This
-avoids Drive read latency during training.
+Safe to rerun. Ensure the Drive training data is complete, then copy the small
+training memmaps to local scratch. This avoids Drive read latency during
+training.
 
 ```python
 # PYTHON CELL
 from pathlib import Path
 import shutil
+import subprocess
+
+ensure_train_sets = Path("/content/CoLoR-ablation/scripts/21_ensure_score_pool_training_sets.py")
+assert ensure_train_sets.exists(), ensure_train_sets
+subprocess.run([
+    "python",
+    str(ensure_train_sets),
+    "--drive-root", str(DRIVE),
+    "--output-dir", str(TRAIN_DATA_DRIVE),
+    "--rebuild-if-missing",
+], check=True)
 
 LOCAL_TRAIN_DATA = Path("/content/score_pool_train_data")
 if LOCAL_TRAIN_DATA.exists():
@@ -321,45 +333,20 @@ print("local train data:", LOCAL_TRAIN_DATA)
 !du -sh /content/score_pool_train_data
 ```
 
-Safe to rerun. Validate the six training datasets and selection diagnostics:
+Safe to rerun. Validate the local copy with the same versioned helper:
 
 ```python
 # PYTHON CELL
-import json
-import numpy as np
-import pandas as pd
+from pathlib import Path
+import subprocess
 
-runs = [
-    "random_positive_oracle_100k",
-    "random_pair_cascade_100k",
-    "random_union_control_100k",
-    "hard_positive_oracle_100k",
-    "hard_pair_cascade_100k",
-    "hard_union_control_100k",
-]
-
-expected_bytes = 100_000 * 512 * 2
-for run_id in runs:
-    run_dir = LOCAL_TRAIN_DATA / run_id
-    tokens = run_dir / "train_tokens.npy"
-    meta = run_dir / "train_meta.parquet"
-    manifest = run_dir / "manifest.json"
-    assert tokens.exists(), tokens
-    assert meta.exists(), meta
-    assert manifest.exists(), manifest
-    assert tokens.stat().st_size == expected_bytes, (run_id, tokens.stat().st_size)
-    arr = np.memmap(tokens, dtype=np.uint16, mode="r", shape=(100_000, 512))
-    frame = pd.read_parquet(meta)
-    data = json.loads(manifest.read_text())
-    assert arr.shape == (100_000, 512)
-    assert len(frame) == 100_000
-    assert data["actual_unique_rows"] == 100_000
-    print(run_id, arr.shape, frame["pool_name"].value_counts().to_dict())
-
-selection = pd.read_csv(LOCAL_TRAIN_DATA / "selection_diagnostics.csv")
-assert len(selection) == 6
-assert set(selection["run_id"]) == set(runs)
-print(selection[["run_id", "selected_rows", "true_positive_count", "true_positive_rate", "oracle_positive_recall"]])
+ensure_train_sets = Path("/content/CoLoR-ablation/scripts/21_ensure_score_pool_training_sets.py")
+subprocess.run([
+    "python",
+    str(ensure_train_sets),
+    "--drive-root", str(DRIVE),
+    "--output-dir", str(LOCAL_TRAIN_DATA),
+], check=True)
 ```
 
 Expected `m=1.5` P0 true-positive rates from the previous local build:
