@@ -1,0 +1,101 @@
+# Runtime overlay template for targeted MC-dropout CoLoR scoring.
+# The Colab notebook merges this with each checkpoint's config.yaml so the
+# model architecture matches the state dict before restoring weights.
+#
+# This template intentionally defaults to the train-mode zero-dropout control.
+# Runtime code patches run_name, save_folder, data.paths, load_path,
+# max_duration, data_start_step, and the target-specific dropout rates.
+
+just_score_model: true
+run_name: targeted_dropout_uncertainty_score_template
+save_folder: outputs/targeted-dropout-uncertainty-template
+load_path: prior
+load_checkpoint_type: unsharded
+max_duration: 192000
+global_train_batch_size: 32
+device_train_microbatch_size: 32
+restore_dataloader: false
+reset_optimizer_state: true
+reset_trainer_state: true
+precision: amp_bf16
+seed: 1
+data_start_step: 0
+
+compile:
+  mode: default
+
+fsdp:
+  precision: mixed
+
+data:
+  paths: null
+  drop_last: true
+  memmap_dtype: uint16
+
+model:
+  attention_dropout: 0.0
+  residual_dropout: 0.0
+  embedding_dropout: 0.0
+
+uncertainty_scoring:
+  enabled: true
+  num_samples: 8
+  perturbation_type: dropout
+  selection_metric: lcb
+  lcb_alpha: 1.0
+  coupled_masks: true
+  activation_noise_std: 0.01
+
+targeted_ladder:
+  subset_id: stage_a_25k
+  rows: 25000
+  shard_rows: 25000
+  configs:
+    - config_id: dropout_trainmode_p000
+      dropout_target: none
+      attention_dropout: 0.0
+      residual_dropout: 0.0
+      embedding_dropout: 0.0
+      purpose: verify train-mode scoring without dropout
+    - config_id: dropout_attn_p001
+      dropout_target: attention
+      attention_dropout: 0.01
+      residual_dropout: 0.0
+      embedding_dropout: 0.0
+      purpose: low perturbation of context routing
+    - config_id: dropout_attn_p002
+      dropout_target: attention
+      attention_dropout: 0.02
+      residual_dropout: 0.0
+      embedding_dropout: 0.0
+      purpose: stronger attention-only signal
+    - config_id: dropout_resid_p001
+      dropout_target: residual
+      attention_dropout: 0.0
+      residual_dropout: 0.01
+      embedding_dropout: 0.0
+      purpose: low perturbation of layer updates
+    - config_id: dropout_resid_p002
+      dropout_target: residual
+      attention_dropout: 0.0
+      residual_dropout: 0.02
+      embedding_dropout: 0.0
+      purpose: stronger residual-only signal
+    - config_id: dropout_embed_p0005
+      dropout_target: embedding
+      attention_dropout: 0.0
+      residual_dropout: 0.0
+      embedding_dropout: 0.005
+      purpose: cautious input perturbation
+    - config_id: dropout_embed_p001
+      dropout_target: embedding
+      attention_dropout: 0.0
+      residual_dropout: 0.0
+      embedding_dropout: 0.01
+      purpose: embedding-only diagnostic
+    - config_id: dropout_attn_resid_p001
+      dropout_target: attention+residual
+      attention_dropout: 0.01
+      residual_dropout: 0.01
+      embedding_dropout: 0.0
+      purpose: low combined attention and residual perturbation

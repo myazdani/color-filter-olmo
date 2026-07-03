@@ -30,6 +30,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-rows", type=int, default=None)
     parser.add_argument("--dropout-rate", type=float, default=float("nan"))
     parser.add_argument("--dropout-target", default="attention+residual+embedding")
+    parser.add_argument("--attention-dropout", type=float, default=None)
+    parser.add_argument("--residual-dropout", type=float, default=None)
+    parser.add_argument("--embedding-dropout", type=float, default=None)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--coupled-masks", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--lcb-alpha", type=float, default=1.0)
@@ -199,6 +202,15 @@ def as_bool_text(value: bool) -> str:
     return "true" if value else "false"
 
 
+def resolved_target_rate(args: argparse.Namespace, attr: str) -> float | None:
+    value = getattr(args, attr)
+    if value is not None:
+        return float(value)
+    if not math.isnan(args.dropout_rate):
+        return float(args.dropout_rate)
+    return None
+
+
 def build_summary(
     *,
     seq_idx: np.ndarray,
@@ -222,6 +234,9 @@ def build_summary(
             "num_samples": color_samples.shape[1],
             "dropout_rate": args.dropout_rate,
             "dropout_target": args.dropout_target,
+            "attention_dropout": resolved_target_rate(args, "attention_dropout"),
+            "residual_dropout": resolved_target_rate(args, "residual_dropout"),
+            "embedding_dropout": resolved_target_rate(args, "embedding_dropout"),
             "seed": -1 if args.seed is None else args.seed,
             "coupled_masks": args.coupled_masks,
             "sign_convention": "color=conditional-prior; lower_is_better",
@@ -296,6 +311,9 @@ def write_npz(
             "num_samples": int(color_samples.shape[1]),
             "dropout_rate": None if math.isnan(args.dropout_rate) else args.dropout_rate,
             "dropout_target": args.dropout_target,
+            "attention_dropout": resolved_target_rate(args, "attention_dropout"),
+            "residual_dropout": resolved_target_rate(args, "residual_dropout"),
+            "embedding_dropout": resolved_target_rate(args, "embedding_dropout"),
             "seed": args.seed,
             "coupled_masks": args.coupled_masks,
             "sample_axis_description": "axis 1 is stochastic sample index k",
@@ -425,6 +443,9 @@ def main() -> None:
         "full_scores_path": None if args.full_scores is None else str(args.full_scores),
         "dropout_rate": None if math.isnan(args.dropout_rate) else args.dropout_rate,
         "dropout_target": args.dropout_target,
+        "attention_dropout": resolved_target_rate(args, "attention_dropout"),
+        "residual_dropout": resolved_target_rate(args, "residual_dropout"),
+        "embedding_dropout": resolved_target_rate(args, "embedding_dropout"),
         "seed": args.seed,
         "coupled_masks": args.coupled_masks,
         "sign_convention": "color=conditional-prior; lower_is_better",

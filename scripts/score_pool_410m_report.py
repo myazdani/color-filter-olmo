@@ -17,25 +17,58 @@ import pandas as pd
 DEFAULT_RUN_IDS = (
     "random_positive_oracle_100k",
     "random_pair_cascade_100k",
+    "random_union_control_100k",
     "hard_positive_oracle_100k",
     "hard_pair_cascade_100k",
+    "hard_union_control_100k",
 )
 
 RUN_LABELS = {
-    "random_positive_oracle_100k": "Random positive oracle",
-    "random_pair_cascade_100k": "Random pair cascade",
-    "hard_positive_oracle_100k": "Hard positive oracle",
-    "hard_pair_cascade_100k": "Hard pair cascade",
+    "random_positive_oracle_100k": "Random positive-only baseline",
+    "random_pair_cascade_100k": "Random PN cascade",
+    "random_union_control_100k": "Random PN mixture control",
+    "hard_positive_oracle_100k": "Hard positive-only baseline",
+    "hard_pair_cascade_100k": "Hard PN cascade",
+    "hard_union_control_100k": "Hard PN mixture control",
+}
+
+RUN_GROUPS = {
+    "random_source": {
+        "title": "Random-source comparison",
+        "run_ids": (
+            "random_positive_oracle_100k",
+            "random_pair_cascade_100k",
+            "random_union_control_100k",
+        ),
+    },
+    "hard_source": {
+        "title": "Hard-source comparison",
+        "run_ids": (
+            "hard_positive_oracle_100k",
+            "hard_pair_cascade_100k",
+            "hard_union_control_100k",
+        ),
+    },
 }
 
 FIGURES = (
     "train_loss_by_run.png",
+    "train_loss_random_source.png",
+    "train_loss_hard_source.png",
     "eval_loss_books_by_run.png",
+    "eval_loss_books_random_source.png",
+    "eval_loss_books_hard_source.png",
     "eval_loss_c4_by_run.png",
+    "eval_loss_c4_random_source.png",
+    "eval_loss_c4_hard_source.png",
     "tokens_per_second_by_run.png",
+    "tokens_per_second_random_source.png",
+    "tokens_per_second_hard_source.png",
     "selection_full_score_distributions.png",
     "selection_pair_mid2_score_distributions.png",
     "selected_set_overlap_heatmap.png",
+    "selected_set_overlap_random_source.png",
+    "selected_set_overlap_hard_source.png",
 )
 
 
@@ -162,7 +195,12 @@ def parse_logs(
     )
 
 
-def load_meta_frames(train_data_dir: Path, run_ids: Iterable[str]) -> pd.DataFrame:
+def load_meta_frames(
+    train_data_dir: Path,
+    run_ids: Iterable[str],
+    *,
+    allow_missing: bool = False,
+) -> pd.DataFrame:
     frames = []
     for run_id in run_ids:
         parquet_path = train_data_dir / run_id / "train_meta.parquet"
@@ -172,9 +210,14 @@ def load_meta_frames(train_data_dir: Path, run_ids: Iterable[str]) -> pd.DataFra
         elif csv_path.exists():
             frame = pd.read_csv(csv_path)
         else:
+            if allow_missing:
+                print("missing train metadata:", parquet_path)
+                continue
             raise FileNotFoundError(parquet_path)
         frame["run_id"] = run_id
         frames.append(frame)
+    if not frames:
+        return pd.DataFrame()
     return pd.concat(frames, ignore_index=True)
 
 
@@ -188,6 +231,48 @@ def savefig(path: Path) -> None:
     print("wrote:", path)
 
 
+def add_variant_label(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame.empty or "run_id" not in frame.columns:
+        return frame
+    labelled = frame.copy()
+    labelled.insert(1, "variant", labelled["run_id"].map(RUN_LABELS).fillna(labelled["run_id"]))
+    return labelled
+
+
+def sort_by_run_order(frame: pd.DataFrame, run_ids: Iterable[str], column: str = "run_id") -> pd.DataFrame:
+    if frame.empty or column not in frame.columns:
+        return frame
+    order = {run_id: index for index, run_id in enumerate(run_ids)}
+    ordered = frame.copy()
+    ordered["_run_order"] = ordered[column].map(order).fillna(len(order))
+    return ordered.sort_values("_run_order").drop(columns="_run_order").reset_index(drop=True)
+
+
+def label_overlap_frame(frame: pd.DataFrame, run_ids: Iterable[str]) -> pd.DataFrame:
+    if frame.empty:
+        return frame
+    labelled = frame.copy()
+    order = {run_id: index for index, run_id in enumerate(run_ids)}
+    if "left_run_id" in labelled.columns:
+        labelled.insert(
+            labelled.columns.get_loc("left_run_id") + 1,
+            "left_variant",
+            labelled["left_run_id"].map(RUN_LABELS).fillna(labelled["left_run_id"]),
+        )
+        labelled["_left_order"] = labelled["left_run_id"].map(order).fillna(len(order))
+    if "right_run_id" in labelled.columns:
+        labelled.insert(
+            labelled.columns.get_loc("right_run_id") + 1,
+            "right_variant",
+            labelled["right_run_id"].map(RUN_LABELS).fillna(labelled["right_run_id"]),
+        )
+        labelled["_right_order"] = labelled["right_run_id"].map(order).fillna(len(order))
+    sort_columns = [col for col in ["_left_order", "_right_order"] if col in labelled.columns]
+    if sort_columns:
+        labelled = labelled.sort_values(sort_columns).drop(columns=sort_columns).reset_index(drop=True)
+    return labelled
+
+
 def generate_figures(
     *,
     train_data_dir: Path,
@@ -196,45 +281,87 @@ def generate_figures(
     train_metrics: pd.DataFrame,
     eval_metrics: pd.DataFrame,
     overlap: pd.DataFrame,
+    allow_log_only_runs: bool,
 ) -> None:
     import matplotlib.pyplot as plt
 
     figures_dir = reports_dir / "figures"
     plt.style.use("default")
 
-    if not train_metrics.empty:
+    def plot_metric_lines(
+        frame: pd.DataFrame,
+        *,
+        run_subset: Iterable[str],
+        y_column: str,
+        filename: str,
+        title: str,
+        ylabel: str,
+    ) -> None:
         plt.figure(figsize=(8, 5))
-        for run_id, frame in train_metrics.groupby("run_id"):
+        plotted = False
+        for run_id in run_subset:
+            group = frame[frame["run_id"] == run_id]
+            if group.empty or y_column not in group.columns:
+                continue
             plt.plot(
-                frame["step"],
-                frame["train_cross_entropy"],
+                group["step"],
+                group[y_column],
                 marker="o",
                 linewidth=1.5,
                 label=RUN_LABELS.get(run_id, run_id),
             )
+            plotted = True
         plt.xlabel("Optimizer step")
-        plt.ylabel("Train cross entropy")
-        plt.title("Training Loss By Run")
-        plt.legend(fontsize=8)
+        plt.ylabel(ylabel)
+        plt.title(title)
+        if plotted:
+            plt.legend(fontsize=8)
+        else:
+            plt.text(0.5, 0.5, "No metrics parsed", ha="center", va="center")
         plt.grid(alpha=0.3)
-        savefig(figures_dir / "train_loss_by_run.png")
+        savefig(figures_dir / filename)
 
-        plt.figure(figsize=(8, 5))
-        for run_id, frame in train_metrics.groupby("run_id"):
-            if "tokens_per_second" in frame:
-                plt.plot(
-                    frame["step"],
-                    frame["tokens_per_second"],
-                    marker="o",
-                    linewidth=1.5,
-                    label=RUN_LABELS.get(run_id, run_id),
-                )
-        plt.xlabel("Optimizer step")
-        plt.ylabel("Device tokens/sec")
-        plt.title("Throughput By Run")
-        plt.legend(fontsize=8)
-        plt.grid(alpha=0.3)
-        savefig(figures_dir / "tokens_per_second_by_run.png")
+    def plot_learning_family(
+        frame: pd.DataFrame,
+        *,
+        y_column: str,
+        filename_prefix: str,
+        title_metric: str,
+        ylabel: str,
+    ) -> None:
+        plot_metric_lines(
+            frame,
+            run_subset=run_ids,
+            y_column=y_column,
+            filename=f"{filename_prefix}_by_run.png",
+            title=f"{title_metric} By Run",
+            ylabel=ylabel,
+        )
+        for suffix, group in RUN_GROUPS.items():
+            plot_metric_lines(
+                frame,
+                run_subset=group["run_ids"],
+                y_column=y_column,
+                filename=f"{filename_prefix}_{suffix}.png",
+                title=f"{group['title']}: {title_metric}",
+                ylabel=ylabel,
+            )
+
+    if not train_metrics.empty:
+        plot_learning_family(
+            train_metrics,
+            y_column="train_cross_entropy",
+            filename_prefix="train_loss",
+            title_metric="Training Loss",
+            ylabel="Train cross entropy",
+        )
+        plot_learning_family(
+            train_metrics,
+            y_column="tokens_per_second",
+            filename_prefix="tokens_per_second",
+            title_metric="Throughput",
+            ylabel="Device tokens/sec",
+        )
 
     eval_ce = (
         eval_metrics[eval_metrics["metric"] == "CrossEntropyLoss"].copy()
@@ -246,27 +373,25 @@ def generate_figures(
         ("c4_val_proxy", "eval_loss_c4_by_run.png", "C4 Validation Proxy Loss By Run"),
     ]:
         frame = eval_ce[eval_ce["label"] == label] if not eval_ce.empty else pd.DataFrame()
-        plt.figure(figsize=(8, 5))
-        if not frame.empty:
-            for run_id, group in frame.groupby("run_id"):
-                plt.plot(
-                    group["step"],
-                    group["value"],
-                    marker="o",
-                    linewidth=1.5,
-                    label=RUN_LABELS.get(run_id, run_id),
-                )
-        else:
+        if frame.empty:
+            plt.figure(figsize=(8, 5))
             plt.text(0.5, 0.5, f"No {label} eval metrics parsed", ha="center", va="center")
-        plt.xlabel("Optimizer step")
-        plt.ylabel("Eval cross entropy")
-        plt.title(title)
-        if not frame.empty:
-            plt.legend(fontsize=8)
-        plt.grid(alpha=0.3)
-        savefig(figures_dir / filename)
+            plt.xlabel("Optimizer step")
+            plt.ylabel("Eval cross entropy")
+            plt.title(title)
+            plt.grid(alpha=0.3)
+            savefig(figures_dir / filename)
+            continue
+        title_metric = "Books Validation Loss" if label == "books_val" else "C4 Validation Proxy Loss"
+        plot_learning_family(
+            frame,
+            y_column="value",
+            filename_prefix="eval_loss_books" if label == "books_val" else "eval_loss_c4",
+            title_metric=title_metric,
+            ylabel="Eval cross entropy",
+        )
 
-    meta_all = load_meta_frames(train_data_dir, run_ids)
+    meta_all = load_meta_frames(train_data_dir, run_ids, allow_missing=allow_log_only_runs)
     for column, filename, title in [
         ("local_full_color_score", "selection_full_score_distributions.png", "Selected Full CoLoR Score Distributions"),
         ("pair_mid2_color_score", "selection_pair_mid2_score_distributions.png", "Selected Pair-Mid2 Score Distributions"),
@@ -277,45 +402,81 @@ def generate_figures(
         else:
             column_to_plot = column
         plt.figure(figsize=(8, 5))
-        if column_to_plot:
+        if column_to_plot and not meta_all.empty:
             for run_id, frame in meta_all.groupby("run_id"):
                 values = frame[column_to_plot].dropna().to_numpy()
                 plt.hist(values, bins=60, alpha=0.35, density=True, label=RUN_LABELS.get(run_id, run_id))
             plt.xlabel(column_to_plot)
             plt.ylabel("Density")
             plt.legend(fontsize=8)
+        elif meta_all.empty:
+            plt.text(0.5, 0.5, "No local selection metadata found", ha="center", va="center")
         else:
             plt.text(0.5, 0.5, f"Missing column {column}", ha="center", va="center")
         plt.title(title)
         plt.grid(alpha=0.2)
         savefig(figures_dir / filename)
 
-    matrix = pd.DataFrame(np.eye(len(run_ids)), index=run_ids, columns=run_ids)
-    for _, row in overlap.iterrows():
-        left = row["left_run_id"]
-        right = row["right_run_id"]
-        value = row.get("seq_idx_jaccard", np.nan)
-        matrix.loc[left, right] = value
-        matrix.loc[right, left] = value
-    plt.figure(figsize=(7, 6))
-    image = plt.imshow(matrix.loc[run_ids, run_ids], vmin=0, vmax=1, cmap="viridis")
-    plt.colorbar(image, label="Seq idx Jaccard")
-    plt.xticks(range(len(run_ids)), [RUN_LABELS[r] for r in run_ids], rotation=35, ha="right", fontsize=8)
-    plt.yticks(range(len(run_ids)), [RUN_LABELS[r] for r in run_ids], fontsize=8)
-    for i in range(len(run_ids)):
-        for j in range(len(run_ids)):
-            value = matrix.iloc[i, j]
-            plt.text(
-                j,
-                i,
-                f"{value:.2f}",
-                ha="center",
-                va="center",
-                color="white" if value < 0.5 else "black",
-                fontsize=8,
-            )
-    plt.title("Selected Set Overlap")
-    savefig(figures_dir / "selected_set_overlap_heatmap.png")
+    def available_overlap_run_ids(candidate_run_ids: Iterable[str]) -> list[str]:
+        selected_run_ids = list(candidate_run_ids)
+        if allow_log_only_runs and not overlap.empty:
+            overlap_ids = set(overlap["left_run_id"]).union(set(overlap["right_run_id"]))
+            selected_run_ids = [run_id for run_id in selected_run_ids if run_id in overlap_ids]
+        return selected_run_ids
+
+    def plot_overlap_heatmap(candidate_run_ids: Iterable[str], filename: str, title: str) -> None:
+        selected_run_ids = available_overlap_run_ids(candidate_run_ids)
+        plt.figure(figsize=(7, 6))
+        if not selected_run_ids:
+            plt.text(0.5, 0.5, "No local selection-overlap metadata found", ha="center", va="center")
+            plt.title(title)
+            savefig(figures_dir / filename)
+            return
+        matrix = pd.DataFrame(np.eye(len(selected_run_ids)), index=selected_run_ids, columns=selected_run_ids)
+        for _, row in overlap.iterrows():
+            left = row["left_run_id"]
+            right = row["right_run_id"]
+            if left not in matrix.index or right not in matrix.columns:
+                continue
+            value = row.get("seq_idx_jaccard", np.nan)
+            matrix.loc[left, right] = value
+            matrix.loc[right, left] = value
+        image = plt.imshow(matrix.loc[selected_run_ids, selected_run_ids], vmin=0, vmax=1, cmap="viridis")
+        plt.colorbar(image, label="Jaccard overlap")
+        plt.xticks(
+            range(len(selected_run_ids)),
+            [RUN_LABELS.get(r, r) for r in selected_run_ids],
+            rotation=35,
+            ha="right",
+            fontsize=8,
+        )
+        plt.yticks(range(len(selected_run_ids)), [RUN_LABELS.get(r, r) for r in selected_run_ids], fontsize=8)
+        for i in range(len(selected_run_ids)):
+            for j in range(len(selected_run_ids)):
+                value = matrix.iloc[i, j]
+                plt.text(
+                    j,
+                    i,
+                    f"{value:.2f}",
+                    ha="center",
+                    va="center",
+                    color="white" if value < 0.5 else "black",
+                    fontsize=8,
+                )
+        plt.title(title)
+        savefig(figures_dir / filename)
+
+    plot_overlap_heatmap(run_ids, "selected_set_overlap_heatmap.png", "Selected Set Overlap Matrix")
+    plot_overlap_heatmap(
+        RUN_GROUPS["random_source"]["run_ids"],
+        "selected_set_overlap_random_source.png",
+        "Random-source Selected Set Overlap",
+    )
+    plot_overlap_heatmap(
+        RUN_GROUPS["hard_source"]["run_ids"],
+        "selected_set_overlap_hard_source.png",
+        "Hard-source Selected Set Overlap",
+    )
 
 
 def md_table(frame: pd.DataFrame, columns: list[str] | None = None, floatfmt: str = ".4f") -> str:
@@ -339,6 +500,7 @@ def md_table(frame: pd.DataFrame, columns: list[str] | None = None, floatfmt: st
 
 def write_report(
     *,
+    run_ids: list[str],
     train_data_dir: Path,
     results_dir: Path,
     reports_dir: Path,
@@ -355,12 +517,14 @@ def write_report(
     overlap: pd.DataFrame,
     train_metrics: pd.DataFrame,
     eval_metrics: pd.DataFrame,
+    allow_log_only_runs: bool,
 ) -> None:
     final_train = (
         train_metrics.sort_values(["run_id", "step"]).groupby("run_id").tail(1).reset_index(drop=True)
         if not train_metrics.empty
         else pd.DataFrame()
     )
+    final_train = add_variant_label(sort_by_run_order(final_train, run_ids))
 
     eval_summary = pd.DataFrame()
     if not eval_metrics.empty:
@@ -372,8 +536,23 @@ def write_report(
             .pivot(index="run_id", columns="label", values="value")
             .reset_index()
         )
+        eval_summary = add_variant_label(sort_by_run_order(eval_summary, run_ids))
 
     manifest = json.loads(eval_manifest_path.read_text())
+    run_count_word = {4: "four", 5: "five", 6: "six"}.get(len(run_ids), str(len(run_ids)))
+    selection = add_variant_label(sort_by_run_order(selection, run_ids))
+    sensitivity = add_variant_label(sort_by_run_order(sensitivity, run_ids))
+    overlap = label_overlap_frame(overlap, run_ids)
+    random_overlap = overlap[
+        overlap["left_run_id"].isin(RUN_GROUPS["random_source"]["run_ids"])
+        & overlap["right_run_id"].isin(RUN_GROUPS["random_source"]["run_ids"])
+    ].reset_index(drop=True)
+    hard_overlap = overlap[
+        overlap["left_run_id"].isin(RUN_GROUPS["hard_source"]["run_ids"])
+        & overlap["right_run_id"].isin(RUN_GROUPS["hard_source"]["run_ids"])
+    ].reset_index(drop=True)
+    selection_run_ids = set(selection["run_id"]) if "run_id" in selection.columns else set()
+    missing_selection_run_ids = [run_id for run_id in run_ids if run_id not in selection_run_ids]
 
     report: list[str] = [
         "# 410M Score-Pool Mini-Universe Training Report",
@@ -381,7 +560,7 @@ def write_report(
         "## Executive Summary",
         "",
         (
-            "This report compares four 410M-class OLMo-style models trained for two passes over "
+            f"This report compares {run_count_word} 410M-class OLMo-style models trained for two passes over "
             "matched 100K-row score-pool mini-universe selections. All production configs use the "
             "same architecture, seed, optimizer, scheduler, tokenizer, batch size, sequence length, "
             "and eval schedule; they differ only in the selected training data."
@@ -397,17 +576,26 @@ def write_report(
         "",
         "## Mini-Universe Definitions",
         "",
-        "- `random_positive_oracle_100k`: all 100K rows from `random_positive`.",
-        "- `hard_positive_oracle_100k`: all 100K rows from `hard_positive`.",
+        "- `random_positive_oracle_100k` (Random positive-only baseline): all 100K rows from `random_positive`.",
+        "- `hard_positive_oracle_100k` (Hard positive-only baseline): all 100K rows from `hard_positive`.",
         (
-            "- `random_pair_cascade_100k`: rank `random_positive union random_negative` "
+            "- `random_pair_cascade_100k` (Random PN cascade): rank `random_positive union random_negative` "
             "with `pair_mid2`, keep `m * 100K` candidates, then rerank by full CoLoR."
         ),
         (
-            "- `hard_pair_cascade_100k`: rank `hard_positive union hard_negative` "
+            "- `random_union_control_100k` (Random PN mixture control): random 100K rows "
+            "from `random_positive union random_negative`."
+        ),
+        (
+            "- `hard_pair_cascade_100k` (Hard PN cascade): rank `hard_positive union hard_negative` "
             "with `pair_mid2`, keep `m * 100K` candidates, then rerank by full CoLoR."
         ),
-        "- Cascade multiplier for trained P0 runs: `m = 1.5`.",
+        (
+            "- `hard_union_control_100k` (Hard PN mixture control): random 100K rows "
+            "from `hard_positive union hard_negative`."
+        ),
+        "- PN means the positive/negative source-pool union for that source family.",
+        "- Cascade multiplier for trained cascade runs: `m = 1.5`.",
         "- Score convention: `conditional_books_loss - prior_loss`; lower is better.",
         "",
         "## Matched Training Setup",
@@ -422,7 +610,30 @@ def write_report(
         "",
         "## Selection Diagnostics",
         "",
-        md_table(selection, ["run_id", "selected_rows", "true_positive_count", "true_positive_rate", "oracle_positive_recall"]),
+        *(
+            [
+                (
+                    "_Local selection metadata is not mirrored for "
+                    f"`{', '.join(missing_selection_run_ids)}`; learning curves and final metrics "
+                    "include those run logs, while selection diagnostics and overlap use the "
+                    "available local training-set metadata._"
+                ),
+                "",
+            ]
+            if allow_log_only_runs and missing_selection_run_ids
+            else []
+        ),
+        md_table(
+            selection,
+            [
+                "run_id",
+                "variant",
+                "selected_rows",
+                "true_positive_count",
+                "true_positive_rate",
+                "oracle_positive_recall",
+            ],
+        ),
         "",
         "## Cascade Multiplier Sensitivity",
         "",
@@ -433,6 +644,7 @@ def write_report(
                     col
                     for col in [
                         "run_id",
+                        "variant",
                         "cascade_multiplier",
                         "candidate_count",
                         "true_positive_count",
@@ -447,9 +659,31 @@ def write_report(
             else "_No sensitivity diagnostics found._"
         ),
         "",
-        "## Selected Set Overlap",
+        "## Selected Set Overlap Matrices",
         "",
-        md_table(overlap) if not overlap.empty else "_No overlap diagnostics parsed._",
+        (
+            "Entries are Jaccard overlap between selected training-row sets over `seq_idx`, "
+            "split into random-source and hard-source comparisons."
+        ),
+        *(
+            [
+                (
+                    "_Union controls without local selected-row metadata are omitted from their "
+                    "source-family overlap matrices until those metadata files are mirrored._"
+                ),
+                "",
+            ]
+            if any(run_id.endswith("union_control_100k") for run_id in missing_selection_run_ids)
+            else []
+        ),
+        "",
+        "### Random Source",
+        "",
+        md_table(random_overlap) if not random_overlap.empty else "_No random-source overlap diagnostics parsed._",
+        "",
+        "### Hard Source",
+        "",
+        md_table(hard_overlap) if not hard_overlap.empty else "_No hard-source overlap diagnostics parsed._",
         "",
         "## Final Training Metrics",
         "",
@@ -460,6 +694,7 @@ def write_report(
                 final_train,
                 [
                     "run_id",
+                    "variant",
                     "step",
                     "train_cross_entropy",
                     "train_perplexity",
@@ -471,16 +706,36 @@ def write_report(
     else:
         report.append("_No training metrics parsed._")
     report.extend(["", "## Final Eval Metrics", ""])
-    report.append(md_table(eval_summary) if not eval_summary.empty else "_No eval metrics parsed._")
-    report.extend(["", "## Figures", ""])
+    report.append(
+        md_table(eval_summary, ["run_id", "variant", "books_val", "c4_val_proxy"])
+        if not eval_summary.empty
+        else "_No eval metrics parsed._"
+    )
+    report.extend(
+        [
+            "",
+            "## Figures",
+            "",
+            (
+                "Learning curves are split by source family so each panel compares selection rules "
+                "within the same positive/negative universe."
+            ),
+            "",
+        ]
+    )
     for filename, caption in [
-        ("train_loss_by_run.png", "Training cross entropy over optimizer steps."),
-        ("eval_loss_books_by_run.png", "Books validation cross entropy over optimizer steps."),
-        ("eval_loss_c4_by_run.png", "C4 validation proxy cross entropy over optimizer steps."),
-        ("tokens_per_second_by_run.png", "Device tokens per second over optimizer steps."),
+        ("train_loss_random_source.png", "Random-source training cross entropy over optimizer steps."),
+        ("train_loss_hard_source.png", "Hard-source training cross entropy over optimizer steps."),
+        ("eval_loss_books_random_source.png", "Random-source Books validation cross entropy over optimizer steps."),
+        ("eval_loss_books_hard_source.png", "Hard-source Books validation cross entropy over optimizer steps."),
+        ("eval_loss_c4_random_source.png", "Random-source C4 validation proxy cross entropy over optimizer steps."),
+        ("eval_loss_c4_hard_source.png", "Hard-source C4 validation proxy cross entropy over optimizer steps."),
+        ("tokens_per_second_random_source.png", "Random-source device tokens per second over optimizer steps."),
+        ("tokens_per_second_hard_source.png", "Hard-source device tokens per second over optimizer steps."),
+        ("selected_set_overlap_random_source.png", "Random-source selected-set overlap matrix, reported as Jaccard overlap over `seq_idx`."),
+        ("selected_set_overlap_hard_source.png", "Hard-source selected-set overlap matrix, reported as Jaccard overlap over `seq_idx`."),
         ("selection_full_score_distributions.png", "Distribution of selected full CoLoR scores."),
         ("selection_pair_mid2_score_distributions.png", "Distribution of selected pair-mid2 CoLoR scores."),
-        ("selected_set_overlap_heatmap.png", "Jaccard overlap between selected training sets."),
     ]:
         report.extend([f"![{caption}](figures/{filename})", ""])
     report.extend(
@@ -584,8 +839,10 @@ def write_metrics_and_report(args: argparse.Namespace) -> None:
         train_metrics=train_metrics,
         eval_metrics=eval_metrics,
         overlap=overlap,
+        allow_log_only_runs=args.allow_log_only_runs,
     )
     write_report(
+        run_ids=run_ids,
         train_data_dir=args.train_data_dir,
         results_dir=args.results_dir,
         reports_dir=args.reports_dir,
@@ -602,6 +859,7 @@ def write_metrics_and_report(args: argparse.Namespace) -> None:
         overlap=overlap,
         train_metrics=train_metrics,
         eval_metrics=eval_metrics,
+        allow_log_only_runs=args.allow_log_only_runs,
     )
     acceptance_check(args)
 
@@ -629,7 +887,11 @@ def acceptance_check(args: argparse.Namespace) -> None:
 
     run_ids = set(args.run_id)
     selection = pd.read_csv(args.results_dir / "selection_diagnostics.csv")
-    if len(selection) != len(run_ids) or set(selection["run_id"]) != run_ids:
+    selection_run_ids = set(selection["run_id"])
+    if args.allow_log_only_runs:
+        if not selection_run_ids.issubset(run_ids):
+            raise AssertionError(selection[["run_id"]])
+    elif len(selection) != len(run_ids) or selection_run_ids != run_ids:
         raise AssertionError(selection[["run_id"]])
     if not (selection["selected_rows"] == 100_000).all():
         raise AssertionError(selection[["run_id", "selected_rows"]])
@@ -674,9 +936,19 @@ def acceptance_check(args: argparse.Namespace) -> None:
     )
 
     manifest = json.loads((args.results_dir / "checkpoint_manifest.json").read_text())
+    log_checkpoint_steps = pd.read_csv(args.results_dir / "checkpoint_save_times.csv")
     for run_id in args.run_id:
         if not manifest["runs"][run_id]["has_final_step780"]:
-            raise AssertionError(manifest["runs"][run_id])
+            has_log_checkpoint = (
+                args.allow_log_only_runs
+                and not log_checkpoint_steps.empty
+                and (
+                    (log_checkpoint_steps["run_id"] == run_id)
+                    & (log_checkpoint_steps["step"] == 780)
+                ).any()
+            )
+            if not has_log_checkpoint:
+                raise AssertionError(manifest["runs"][run_id])
     print("acceptance checks passed")
 
 
@@ -696,6 +968,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--eval-interval", type=int, default=78)
     parser.add_argument("--device-eval-batch-size", type=int, default=16)
     parser.add_argument("--run-id", action="append", default=None)
+    parser.add_argument("--allow-log-only-runs", action="store_true")
     parser.add_argument("--check-only", action="store_true")
     return parser
 

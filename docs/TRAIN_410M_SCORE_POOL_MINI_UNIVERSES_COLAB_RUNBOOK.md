@@ -2,15 +2,21 @@
 
 This runbook is the canonical from-scratch Colab workflow for
 `tasks/TASK_train_410m_100m_color_filtered_books.md`. It trains the four P0
-models, evaluates them during training, writes all metrics and figures to
-Google Drive, and produces a reproducible report.
+models plus the random and hard union controls, evaluates them during training,
+writes all metrics and figures to Google Drive, and produces a reproducible
+report.
 
-The four P0 runs are:
+The six production runs are:
 
 1. `random_positive_oracle_100k`
 2. `random_pair_cascade_100k`
-3. `hard_positive_oracle_100k`
-4. `hard_pair_cascade_100k`
+3. `random_union_control_100k`
+4. `hard_positive_oracle_100k`
+5. `hard_pair_cascade_100k`
+6. `hard_union_control_100k`
+
+The two union controls are P2 controls: each samples 100K rows from its matched
+positive/negative mini-universe without using CoLoR ranking.
 
 The checked-in base sweep configs are used as templates. The Colab runtime
 generates production configs with local Drive paths and explicit Books/C4 LM
@@ -19,7 +25,7 @@ the notebook.
 
 ## Local Preconditions
 
-The four training datasets must already be built by:
+The six training datasets must already be built by:
 
 ```text
 color-filter-ablation/scripts/18_build_score_pool_training_sets.py
@@ -66,7 +72,7 @@ Expected resources:
 GPU RAM:          A100 80GB preferred
 System RAM:       Colab high-RAM recommended
 Local scratch:    < 5GB for copied train/eval memmaps and logs
-Drive data:       ~423MB for training sets, ~500MB for Books eval subset/cache
+Drive data:       ~640MB for training sets, ~500MB for Books eval subset/cache
 Drive outputs:    50GB recommended if retaining step390 and step780 checkpoints
 Remote data:      Books eval from hlzhang109/CoLoR-filter; C4 proxy from allenai/c4
 ```
@@ -84,6 +90,7 @@ epochs per run:                2
 optimizer steps per run:       780
 tokens per run:                102,236,160
 P0 optimizer steps total:      3,120
+all six optimizer steps total: 4,680
 ```
 
 Production evals run every 78 optimizer steps so the curves include the final
@@ -276,8 +283,10 @@ required_paths = [
     Path("/content/color-filter-olmo/scripts/score_pool_410m_report.py"),
     Path("/content/color-filter-olmo/configs/sweeps/score-pool-410m-100m-random-positive-oracle.yaml"),
     Path("/content/color-filter-olmo/configs/sweeps/score-pool-410m-100m-random-pair-cascade.yaml"),
+    Path("/content/color-filter-olmo/configs/sweeps/score-pool-410m-100m-random-union-control.yaml"),
     Path("/content/color-filter-olmo/configs/sweeps/score-pool-410m-100m-hard-positive-oracle.yaml"),
     Path("/content/color-filter-olmo/configs/sweeps/score-pool-410m-100m-hard-pair-cascade.yaml"),
+    Path("/content/color-filter-olmo/configs/sweeps/score-pool-410m-100m-hard-union-control.yaml"),
 ]
 for path in required_paths:
     if not path.exists():
@@ -312,7 +321,7 @@ print("local train data:", LOCAL_TRAIN_DATA)
 !du -sh /content/score_pool_train_data
 ```
 
-Safe to rerun. Validate the four training datasets and selection diagnostics:
+Safe to rerun. Validate the six training datasets and selection diagnostics:
 
 ```python
 # PYTHON CELL
@@ -323,8 +332,10 @@ import pandas as pd
 runs = [
     "random_positive_oracle_100k",
     "random_pair_cascade_100k",
+    "random_union_control_100k",
     "hard_positive_oracle_100k",
     "hard_pair_cascade_100k",
+    "hard_union_control_100k",
 ]
 
 expected_bytes = 100_000 * 512 * 2
@@ -346,12 +357,12 @@ for run_id in runs:
     print(run_id, arr.shape, frame["pool_name"].value_counts().to_dict())
 
 selection = pd.read_csv(LOCAL_TRAIN_DATA / "selection_diagnostics.csv")
-assert len(selection) == 4
+assert len(selection) == 6
 assert set(selection["run_id"]) == set(runs)
 print(selection[["run_id", "selected_rows", "true_positive_count", "true_positive_rate", "oracle_positive_recall"]])
 ```
 
-Expected `m=1.5` true-positive rates:
+Expected `m=1.5` P0 true-positive rates from the previous local build:
 
 ```text
 random_positive_oracle_100k: 1.00000
@@ -359,6 +370,9 @@ hard_positive_oracle_100k:   1.00000
 random_pair_cascade_100k:    0.93338
 hard_pair_cascade_100k:      0.66184
 ```
+
+The union controls are random 100K samples from balanced 200K-row universes, so
+their true-positive rates should be near 0.5 but are not asserted exactly.
 
 Safe to rerun. Create bounded, aligned LM eval memmaps. Books uses the original
 CoLoR-Filter Books validation tokens. C4 uses a fixed public validation proxy
@@ -497,8 +511,10 @@ os.environ["PYTHONUNBUFFERED"] = "1"
 config_map = {
     "random_positive_oracle_100k": OLMO_DIR / "configs/sweeps/score-pool-410m-100m-random-positive-oracle.yaml",
     "random_pair_cascade_100k": OLMO_DIR / "configs/sweeps/score-pool-410m-100m-random-pair-cascade.yaml",
+    "random_union_control_100k": OLMO_DIR / "configs/sweeps/score-pool-410m-100m-random-union-control.yaml",
     "hard_positive_oracle_100k": OLMO_DIR / "configs/sweeps/score-pool-410m-100m-hard-positive-oracle.yaml",
     "hard_pair_cascade_100k": OLMO_DIR / "configs/sweeps/score-pool-410m-100m-hard-pair-cascade.yaml",
+    "hard_union_control_100k": OLMO_DIR / "configs/sweeps/score-pool-410m-100m-hard-union-control.yaml",
 }
 
 runtime_config_map = {}
@@ -824,8 +840,8 @@ print("MICROBATCH:", MICROBATCH)
 
 ## 7. Full Resumable Training Runs
 
-Full run. Train all four models in the P0 order under the fresh eval-enabled
-experiment directory. The helper skips only logs that contain `Training complete`
+Full run. Train all six models under the fresh eval-enabled experiment
+directory. The helper skips only logs that contain `Training complete`
 and the expected eval curves. If interrupted before completion, it appends to
 the existing log and resumes from the latest checkpoint so partial learning
 curves are preserved.
@@ -835,8 +851,10 @@ curves are preserved.
 production_order = [
     "random_positive_oracle_100k",
     "random_pair_cascade_100k",
+    "random_union_control_100k",
     "hard_positive_oracle_100k",
     "hard_pair_cascade_100k",
+    "hard_union_control_100k",
 ]
 
 EXPECTED_EVAL_POINTS = 10
@@ -951,8 +969,10 @@ import subprocess
 report_run_ids = globals().get("production_order", [
     "random_positive_oracle_100k",
     "random_pair_cascade_100k",
+    "random_union_control_100k",
     "hard_positive_oracle_100k",
     "hard_pair_cascade_100k",
+    "hard_union_control_100k",
 ])
 
 def build_report_cmd(check_only: bool = False) -> list[str]:
@@ -1066,16 +1086,20 @@ Pause before launching later runs if:
 - a production run produces non-finite train or eval losses;
 - Books validation is missing from logs after a completed run;
 - Drive has insufficient space for the remaining checkpoints;
-- the random-pair cascade result is clearly broken and the hard-pair runs no
-  longer answer the current research question.
+- the random-pair cascade result is clearly broken and the remaining hard-source
+  runs no longer answer the current research question.
 
-For expected interpretation, compare each cascade run with its matched oracle:
+For expected interpretation, compare each cascade and union-control run with its
+matched oracle:
 
 ```text
-random_pair_cascade_100k vs random_positive_oracle_100k
-hard_pair_cascade_100k   vs hard_positive_oracle_100k
+random_pair_cascade_100k  vs random_positive_oracle_100k
+random_union_control_100k vs random_positive_oracle_100k
+hard_pair_cascade_100k    vs hard_positive_oracle_100k
+hard_union_control_100k   vs hard_positive_oracle_100k
 ```
 
 The key outcome is whether the cascade gets close to the oracle-positive Books
-validation curve while retaining a high true-positive rate. The C4 proxy is a
-secondary general-domain sanity check, not the primary target metric.
+validation curve while retaining a high true-positive rate, and whether either
+union control narrows or widens that gap. The C4 proxy is a secondary
+general-domain sanity check, not the primary target metric.

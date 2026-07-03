@@ -25,6 +25,9 @@ precision: amp_bf16
 seed: 1
 data_start_step: 0
 
+compile:
+  mode: default
+
 fsdp:
   precision: mixed
 
