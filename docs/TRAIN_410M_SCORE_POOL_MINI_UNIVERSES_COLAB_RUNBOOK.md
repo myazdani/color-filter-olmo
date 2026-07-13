@@ -1094,6 +1094,170 @@ figures/selection_pair_mid2_score_distributions.png
 figures/selected_set_overlap_heatmap.png
 ```
 
+Safe to rerun after Section 9. This builds a lightweight zip for local figure
+regeneration. It includes logs, generated metrics, reports, figures, runtime
+configs, eval manifest, and train-set metadata, but intentionally excludes
+checkpoint weights and `train_tokens.npy`.
+
+```python
+# PYTHON CELL
+from pathlib import Path
+from zipfile import ZipFile, ZIP_DEFLATED
+from google.colab import files
+import fnmatch
+import json
+import re
+
+AUTO_DOWNLOAD_BUNDLE = True
+ZIP_PATH = Path(f"/content/score_pool_410m_{EXPERIMENT}_figure_bundle.zip")
+
+bundle_run_ids = list(globals().get("report_run_ids", globals().get("production_order", [
+    "random_positive_oracle_100k",
+    "random_pair_cascade_100k",
+    "random_union_control_100k",
+    "hard_positive_oracle_100k",
+    "hard_pair_cascade_100k",
+    "hard_union_control_100k",
+])))
+
+def bundle_base_run_id(run_id: str) -> str:
+    match = re.match(r"^(.+)_seed\d+_100k$", run_id)
+    return f"{match.group(1)}_100k" if match else run_id
+
+required_files = [
+    RESULTS_DRIVE / "train_metrics_from_logs.csv",
+    RESULTS_DRIVE / "eval_metrics_from_logs.csv",
+    RESULTS_DRIVE / "checkpoint_save_times.csv",
+    RESULTS_DRIVE / "throughput_comparison.csv",
+    RESULTS_DRIVE / "selection_diagnostics.csv",
+    RESULTS_DRIVE / "overlap_jaccard.csv",
+    RESULTS_DRIVE / "checkpoint_manifest.json",
+    REPORTS_DRIVE / "report.md",
+    REPORTS_DRIVE / "report.html",
+    FIGURES_DRIVE / "eval_loss_books_by_run.png",
+    FIGURES_DRIVE / "eval_loss_books_hard_oracle_vs_cascade_seeds.png",
+    EVAL_MANIFEST,
+]
+required_files.extend(RESULTS_DRIVE / f"{run_id}.log" for run_id in bundle_run_ids)
+for run_id in sorted({bundle_base_run_id(run_id) for run_id in bundle_run_ids}):
+    required_files.extend([
+        TRAIN_DATA_DRIVE / run_id / "train_meta.parquet",
+        TRAIN_DATA_DRIVE / run_id / "manifest.json",
+    ])
+
+missing_required = [str(path) for path in required_files if not path.exists()]
+if missing_required:
+    raise FileNotFoundError("Run Sections 3 and 9 before bundling. Missing:\n" + "\n".join(missing_required))
+
+def add_file(zf, src: Path, dst: str, manifest: list[dict[str, object]]) -> bool:
+    if not src.exists() or not src.is_file():
+        return False
+    zf.write(src, dst)
+    manifest.append({"src": str(src), "dst": dst, "bytes": src.stat().st_size})
+    return True
+
+def add_tree(
+    zf,
+    src_dir: Path,
+    dst_dir: str,
+    manifest: list[dict[str, object]],
+    patterns: list[str],
+) -> int:
+    if not src_dir.exists():
+        print("missing directory:", src_dir)
+        return 0
+    count = 0
+    for path in sorted(src_dir.rglob("*")):
+        if not path.is_file():
+            continue
+        rel = path.relative_to(src_dir)
+        rel_posix = rel.as_posix()
+        if not any(fnmatch.fnmatch(rel_posix, pattern) for pattern in patterns):
+            continue
+        if rel_posix.endswith("train_tokens.npy"):
+            continue
+        add_file(zf, path, f"{dst_dir}/{rel_posix}", manifest)
+        count += 1
+    return count
+
+manifest = []
+if ZIP_PATH.exists():
+    ZIP_PATH.unlink()
+
+with ZipFile(ZIP_PATH, "w", compression=ZIP_DEFLATED) as zf:
+    add_tree(
+        zf,
+        RESULTS_DRIVE,
+        f"color-filter-ablation/results/{EXPERIMENT}",
+        manifest,
+        patterns=["*.log", "*.csv", "*.json", "*.jsonl"],
+    )
+    add_tree(
+        zf,
+        REPORTS_DRIVE,
+        f"color-filter-ablation/reports/{EXPERIMENT}",
+        manifest,
+        patterns=["report.md", "report.html", "figures/*.png", "quick_checks/*.png"],
+    )
+    add_tree(
+        zf,
+        TRAIN_DATA_DRIVE,
+        f"color-filter-ablation/data/{TRAIN_DATASET}",
+        manifest,
+        patterns=[
+            "selection_diagnostics.csv",
+            "selection_sensitivity.csv",
+            "overlap_jaccard.csv",
+            "comparison_manifest.json",
+            "*/train_meta.parquet",
+            "*/train_meta.csv",
+            "*/manifest.json",
+        ],
+    )
+    add_file(
+        zf,
+        EVAL_MANIFEST,
+        f"color-filter-ablation/data/eval/{EXPERIMENT}/eval_manifest.json",
+        manifest,
+    )
+    add_tree(
+        zf,
+        RUNTIME_CONFIG_DIR,
+        f"color-filter-olmo/runtime_configs/{EXPERIMENT}",
+        manifest,
+        patterns=["*.yaml"],
+    )
+    add_file(
+        zf,
+        OLMO_DIR / "scripts" / "score_pool_410m_report.py",
+        "color-filter-olmo/scripts/score_pool_410m_report.py",
+        manifest,
+    )
+    zf.writestr(
+        "score_pool_410m_figure_bundle_manifest.json",
+        json.dumps(
+            {
+                "experiment": EXPERIMENT,
+                "train_dataset": TRAIN_DATASET,
+                "run_ids": bundle_run_ids,
+                "ablation_sha": ABLATION_SHA,
+                "olmo_sha": OLMO_SHA,
+                "files": manifest,
+            },
+            indent=2,
+        ),
+    )
+
+print("files packaged:", len(manifest))
+print("zip:", ZIP_PATH, f"{ZIP_PATH.stat().st_size / 1_000_000:.1f} MB")
+print("run logs:", sum(1 for item in manifest if item["dst"].endswith(".log")))
+print("figures:", sum(1 for item in manifest if "/figures/" in item["dst"] and item["dst"].endswith(".png")))
+print("train metadata files:", sum(1 for item in manifest if item["dst"].endswith("train_meta.parquet")))
+
+if AUTO_DOWNLOAD_BUNDLE:
+    files.download(str(ZIP_PATH))
+```
+
 ## 11. Output Review And Acceptance Checks
 
 Safe to rerun. Run this after Section 9. It verifies the metrics CSVs, report
