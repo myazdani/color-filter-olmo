@@ -1,4 +1,6 @@
 import os
+from typing import Optional
+
 import torch
 import numpy as np
 from ..aliases import PathOrStr
@@ -72,16 +74,21 @@ class DictMemmapWriter:
         seq_len: int = 1,
         file_seqs: int = 1048576,
         memmap_dtype=np.float32,
+        max_entries: Optional[int] = None,
     ):
         self.path = path
         self.file_seqs = file_seqs
         self.seq_len = seq_len
         self.memmap_dtype = memmap_dtype
 
+        if max_entries is not None and max_entries < 1:
+            raise ValueError("max_entries must be positive")
+        self.max_entries = int(1e8) if max_entries is None else max_entries
+
         if not os.path.exists(self.path):
             os.makedirs(self.path)
         self.mmap_idx = np.memmap(
-            os.path.join(self.path, "mmap_index.npy"), dtype=np.int64, mode="w+", shape=(int(1e8),)
+            os.path.join(self.path, "mmap_index.npy"), dtype=np.int64, mode="w+", shape=(self.max_entries,)
         )
 
         self.curr_file_idx = 0
@@ -103,6 +110,10 @@ class DictMemmapWriter:
     def write(self, idx: np.ndarray, data: np.ndarray):
         assert len(data.shape) == 2  # Assume data is a batch of flat sequences
         for d, i in zip(data, idx):
+            if self.curr_idx_inside_of_mmap_idx >= self.max_entries:
+                raise RuntimeError(
+                    f"DictMemmapWriter capacity exceeded: max_entries={self.max_entries}"
+                )
             if self.curr_idx_inside_of_file == self.file_seqs:
                 self.curr_memmap.flush()
                 self.mmap_idx.flush()

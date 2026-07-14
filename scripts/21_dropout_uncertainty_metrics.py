@@ -260,23 +260,47 @@ def build_summary(
     return frame
 
 
-def attach_optional_tables(summary, metadata_path: Path | None, full_scores_path: Path | None):
+def align_optional_frame(frame, score_index: np.ndarray, *, label: str):
+    score_index = np.asarray(score_index)
+    if score_index.ndim != 1:
+        raise ValueError(f"{label} score_index must be rank-1, got shape {score_index.shape}")
+    if not np.issubdtype(score_index.dtype, np.integer):
+        raise ValueError(f"{label} score_index must contain integers, got {score_index.dtype}")
+    if len(np.unique(score_index)) != len(score_index):
+        raise ValueError(f"{label} score_index contains duplicate rows; optional-table alignment is ambiguous")
+    if len(score_index) and int(score_index.min()) < 0:
+        raise ValueError(f"{label} score_index contains a negative row")
+    if len(score_index) and int(score_index.max()) >= len(frame):
+        raise ValueError(
+            f"{label} has {len(frame)} rows, but score_index references row {int(score_index.max())}"
+        )
+    return frame.iloc[score_index.astype(np.int64)].reset_index(drop=True)
+
+
+def attach_optional_tables(
+    summary,
+    metadata_path: Path | None,
+    full_scores_path: Path | None,
+    score_index: np.ndarray,
+):
+    if len(score_index) != len(summary):
+        raise ValueError(f"score_index has {len(score_index)} rows, but summary has {len(summary)}")
+    summary["seq_idx"] = np.asarray(score_index, dtype=np.int64)
+
     metadata = load_optional_frame(metadata_path)
     if metadata is not None:
-        if len(metadata) < len(summary):
-            raise ValueError(f"Metadata has {len(metadata)} rows, but summary has {len(summary)}")
-        metadata = metadata.iloc[: len(summary)].reset_index(drop=True)
+        metadata = align_optional_frame(metadata, score_index, label="Metadata")
         for column in ("pool_name", "c4_index", "row_position"):
             if column in metadata.columns and column not in summary.columns:
                 summary[column] = metadata[column].to_numpy()
         if "seq_idx" in metadata.columns:
-            summary["meta_seq_idx"] = metadata["seq_idx"].to_numpy()
+            metadata_seq_idx = metadata["seq_idx"].to_numpy(dtype=np.int64)
+            summary["seq_idx"] = metadata_seq_idx
+            summary["meta_seq_idx"] = metadata_seq_idx
 
     full_scores = load_optional_frame(full_scores_path)
     if full_scores is not None:
-        if len(full_scores) < len(summary):
-            raise ValueError(f"Full-score table has {len(full_scores)} rows, but summary has {len(summary)}")
-        full_scores = full_scores.iloc[: len(summary)].reset_index(drop=True)
+        full_scores = align_optional_frame(full_scores, score_index, label="Full-score table")
         color_col = first_existing_column(
             full_scores,
             (
@@ -318,6 +342,8 @@ def write_npz(
             "coupled_masks": args.coupled_masks,
             "sample_axis_description": "axis 1 is stochastic sample index k",
             "sign_convention": "color=conditional-prior; utility=prior-conditional",
+            "row_alignment": "metadata_and_full_scores_indexed_by_score_index",
+            "selection_id_source": "metadata.seq_idx_or_score_index",
         },
         sort_keys=True,
     )
@@ -401,15 +427,15 @@ def main() -> None:
 
     color_samples = (conditional_samples - prior_samples).astype(np.float32)
     utility_samples = -color_samples
-    seq_idx = np.arange(len(prior_index), dtype=np.int64)
     summary = build_summary(
-        seq_idx=seq_idx,
+        seq_idx=prior_index,
         score_index=prior_index,
         color_samples=color_samples,
         utility_samples=utility_samples,
         args=args,
     )
-    summary = attach_optional_tables(summary, args.metadata, args.full_scores)
+    summary = attach_optional_tables(summary, args.metadata, args.full_scores, prior_index)
+    seq_idx = summary["seq_idx"].to_numpy(dtype=np.int64)
 
     npz_path = args.output_dir / f"mc_samples_{args.config_id}.npz"
     parquet_path = args.output_dir / f"mc_samples_{args.config_id}.parquet"
@@ -448,6 +474,8 @@ def main() -> None:
         "embedding_dropout": resolved_target_rate(args, "embedding_dropout"),
         "seed": args.seed,
         "coupled_masks": args.coupled_masks,
+        "row_alignment": "metadata_and_full_scores_indexed_by_score_index",
+        "selection_id_source": "metadata.seq_idx_or_score_index",
         "sign_convention": "color=conditional-prior; lower_is_better",
         "sample_axis_description": "axis 1 is stochastic sample index k",
     }

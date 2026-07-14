@@ -69,7 +69,8 @@ class Scorer(Trainer):
                 self.fsdp_model.eval()
 
     def set_stochastic_sample_seed(self, sample_idx: int):
-        sample_seed = self.cfg.seed + (self.global_step * self.num_stochastic_samples) + sample_idx
+        scoring_step = self.global_step + int(self.cfg.data_start_step or 0)
+        sample_seed = self.cfg.seed + (scoring_step * self.num_stochastic_samples) + sample_idx
         if not self.cfg.uncertainty_scoring.coupled_masks:
             sample_seed += int(time.time())
         torch.manual_seed(sample_seed)
@@ -144,6 +145,7 @@ class Scorer(Trainer):
             Path(self.cfg.save_folder) / "score",
             memmap_dtype=np.float32,
             seq_len=self.num_stochastic_samples,
+            max_entries=max(1, (self.max_steps - self.global_step) * self.cfg.global_train_batch_size),
         )
 
         # Initialize monitors.
