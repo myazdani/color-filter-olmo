@@ -15,7 +15,7 @@ license = { file = "LICENSE" }
 dependencies = [
     "numpy",
     "torch>=2.1,<2.3; python_version < '3.12'",
-    "torch>=2.10,<2.11; python_version >= '3.12'",
+    "torch>=2.10,<2.12; python_version >= '3.12'",
     "omegaconf",
     "rich",
     "boto3",
