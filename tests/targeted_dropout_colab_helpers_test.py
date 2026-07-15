@@ -59,7 +59,9 @@ def test_shard_payload_preserves_resume_contract(tmp_path):
         stage_root=tmp_path / "stage",
         subset_raw=tmp_path / "tokens.raw",
         run_state_path=tmp_path / "run-state.json",
-        olmo_sha="abc123",
+        producer_sha="producer123",
+        analysis_sha="analysis123",
+        notebook_revision="stage-c-test",
         run_stage="stage_b_100k",
         subset_id="stage_b_100k",
         subset_fingerprint="subset-hash",
@@ -83,8 +85,78 @@ def test_shard_payload_preserves_resume_contract(tmp_path):
 
     payload = runner.shard_experiment_payload(config, "prior", shard, 16)
 
-    assert payload["schema_version"] == 3
+    assert payload["schema_version"] == 4
+    assert payload["producer_sha"] == "producer123"
     assert payload["runtime_identity"]["torch"] == "2.11.0+cu128"
     assert payload["checkpoint_identity"] == {"model": "prior-hash"}
     assert payload["shard"] == shard
     assert runner.shard_experiment_fingerprint(config, "prior", shard, 16) == (HELPERS.canonical_sha256(payload))
+
+
+def test_runtime_validation_allows_one_batch_tail_without_throughput():
+    HELPERS.validate_runtime_records(
+        [
+            {
+                "rows": 320,
+                "elapsed_seconds": 10.0,
+                "tokens_per_second": 48000.0,
+                "batches_per_second": 2.9,
+                "peak_gpu_memory_mb": 3216.0,
+                "microbatch": 32,
+            },
+            {
+                "rows": 32,
+                "elapsed_seconds": 2.0,
+                "tokens_per_second": None,
+                "batches_per_second": None,
+                "peak_gpu_memory_mb": 3216.0,
+                "microbatch": 32,
+            },
+        ],
+        global_batch_size=32,
+        expected_microbatch=32,
+    )
+
+
+def test_runtime_validation_rejects_missing_multi_batch_throughput():
+    with pytest.raises(RuntimeError, match="multi-batch"):
+        HELPERS.validate_runtime_records(
+            [
+                {
+                    "rows": 64,
+                    "elapsed_seconds": 2.0,
+                    "tokens_per_second": None,
+                    "batches_per_second": None,
+                    "peak_gpu_memory_mb": 3216.0,
+                    "microbatch": 32,
+                }
+            ],
+            global_batch_size=32,
+            expected_microbatch=32,
+        )
+
+
+def test_create_verified_archive_copies_crc_checked_drive_fallback(tmp_path):
+    first = tmp_path / "first.txt"
+    second = tmp_path / "second.txt"
+    first.write_text("first\n")
+    second.write_text("second\n")
+    local_archive = tmp_path / "local" / "bundle.zip"
+    drive_archive = tmp_path / "drive" / "bundle.zip"
+
+    local, drive = HELPERS.create_verified_archive(
+        [(first, "inputs/first.txt"), (second, "inputs/second.txt")],
+        {"producer_sha": "producer", "analysis_sha": "analysis"},
+        local_archive,
+        drive_archive,
+    )
+
+    assert local == local_archive
+    assert drive == drive_archive
+    assert local.read_bytes() == drive.read_bytes()
+    assert drive.with_suffix(".manifest.json").is_file()
+    assert set(HELPERS.verify_bundle_archive(drive)) == {
+        "bundle_manifest.json",
+        "inputs/first.txt",
+        "inputs/second.txt",
+    }
