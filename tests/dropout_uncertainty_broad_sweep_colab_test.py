@@ -10,7 +10,8 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 HELPER_PATH = ROOT / "scripts" / "dropout_uncertainty_broad_sweep_colab.py"
 NOTEBOOK_PATH = ROOT / "notebooks" / "dropout_uncertainty_broad_rate_sweep_colab.ipynb"
-PINNED_SHA = "cc8909a9062d6790e3c59dba445e39763add6a63"
+PINNED_PRODUCER_SHA = "a7a0bd55313255760c1e946f3e05a7b3767a858e"
+PINNED_ANALYSIS_SHA = "cc8909a9062d6790e3c59dba445e39763add6a63"
 SPEC = importlib.util.spec_from_file_location("dropout_uncertainty_broad_sweep_colab", HELPER_PATH)
 assert SPEC is not None and SPEC.loader is not None
 HELPER = importlib.util.module_from_spec(SPEC)
@@ -128,8 +129,8 @@ def test_notebook_compiles_and_declares_hardened_sweep_contract():
         assert cell.get("execution_count") is None
     for config in sweep_configs():
         assert config["config_id"] in source
-    assert f"PRODUCER_SHA = '{PINNED_SHA}'" in source
-    assert f"ANALYSIS_SHA = '{PINNED_SHA}'" in source
+    assert f"PRODUCER_SHA = '{PINNED_PRODUCER_SHA}'" in source
+    assert f"ANALYSIS_SHA = '{PINNED_ANALYSIS_SHA}'" in source
     assert "checkout_exact(PRODUCER_DIR, PRODUCER_SHA)" in source
     assert "checkout_exact(ANALYSIS_DIR, ANALYSIS_SHA)" in source
     assert "analysis_olmo_dir=ANALYSIS_DIR" in source
