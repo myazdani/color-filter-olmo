@@ -1,4 +1,5 @@
 import importlib.util
+import sys
 from pathlib import Path
 
 import pytest
@@ -91,6 +92,122 @@ def test_shard_payload_preserves_resume_contract(tmp_path):
     assert payload["checkpoint_identity"] == {"model": "prior-hash"}
     assert payload["shard"] == shard
     assert runner.shard_experiment_fingerprint(config, "prior", shard, 16) == (HELPERS.canonical_sha256(payload))
+
+
+def test_config_num_samples_override_is_part_of_resume_contract(tmp_path):
+    context = HELPERS.ScoringContext(
+        olmo_dir=tmp_path,
+        template_config=tmp_path / "template.yaml",
+        runtime_checkpoint_dir=tmp_path / "checkpoints",
+        runtime_config_dir=tmp_path / "configs",
+        config_drive=tmp_path / "drive-configs",
+        raw_score_drive=tmp_path / "scores",
+        stage_root=tmp_path / "stage",
+        subset_raw=tmp_path / "tokens.raw",
+        run_state_path=tmp_path / "run-state.json",
+        producer_sha="producer123",
+        analysis_sha="analysis123",
+        notebook_revision="broad-sweep-test",
+        run_stage="broad_rate_sweep_500k",
+        subset_id="broad_rate_sweep_500k",
+        subset_fingerprint="subset-hash",
+        runtime_identity={"torch": "2.11.0+cu128"},
+        checkpoint_identities={"prior": {"model": "prior-hash"}},
+        seed=1,
+        num_samples=8,
+        global_batch_size=32,
+        stage_rows=500000,
+        shard_rows=24992,
+        file_seqs=1048576,
+    )
+    runner = HELPERS.TargetedDropoutRunner(context)
+    config = {
+        "config_id": "dropout_broad_k1_p000",
+        "num_samples": 1,
+        "attention_dropout": 0.0,
+        "residual_dropout": 0.0,
+        "embedding_dropout": 0.0,
+    }
+    shard = {"start": 0, "end": 32, "rows": 32, "data_start_step": 0}
+
+    payload = runner.shard_experiment_payload(config, "prior", shard, 16)
+
+    assert runner.config_num_samples(config) == 1
+    assert payload["num_samples"] == 1
+    assert payload["config"]["num_samples"] == 1
+
+
+def test_config_num_samples_override_must_be_positive(tmp_path):
+    context = HELPERS.ScoringContext(
+        olmo_dir=tmp_path,
+        template_config=tmp_path / "template.yaml",
+        runtime_checkpoint_dir=tmp_path,
+        runtime_config_dir=tmp_path,
+        config_drive=tmp_path,
+        raw_score_drive=tmp_path,
+        stage_root=tmp_path,
+        subset_raw=tmp_path / "tokens.raw",
+        run_state_path=tmp_path / "state.json",
+        producer_sha="producer",
+        analysis_sha="analysis",
+        notebook_revision="test",
+        run_stage="test",
+        subset_id="test",
+        subset_fingerprint="subset",
+        runtime_identity={},
+        checkpoint_identities={},
+        seed=1,
+        num_samples=8,
+        global_batch_size=32,
+        stage_rows=32,
+        shard_rows=32,
+        file_seqs=32,
+    )
+
+    with pytest.raises(ValueError, match="must be positive"):
+        HELPERS.TargetedDropoutRunner(context).config_num_samples({"config_id": "bad", "num_samples": 0})
+
+
+def test_run_logged_streams_output_and_emits_heartbeat(tmp_path, capsys):
+    context = HELPERS.ScoringContext(
+        olmo_dir=tmp_path,
+        template_config=tmp_path / "template.yaml",
+        runtime_checkpoint_dir=tmp_path,
+        runtime_config_dir=tmp_path,
+        config_drive=tmp_path,
+        raw_score_drive=tmp_path,
+        stage_root=tmp_path,
+        subset_raw=tmp_path / "tokens.raw",
+        run_state_path=tmp_path / "state.json",
+        producer_sha="producer",
+        analysis_sha="analysis",
+        notebook_revision="test",
+        run_stage="test",
+        subset_id="test",
+        subset_fingerprint="subset",
+        runtime_identity={},
+        checkpoint_identities={},
+        seed=1,
+        num_samples=1,
+        global_batch_size=1,
+        stage_rows=1,
+        shard_rows=1,
+        file_seqs=1,
+    )
+
+    log_path = tmp_path / "command.log"
+    HELPERS.TargetedDropoutRunner(context).run_logged(
+        [sys.executable, "-u", "-c", "import time; print('child-ready'); time.sleep(0.08)"],
+        log_path,
+        heartbeat_seconds=0.01,
+        label="test command",
+    )
+
+    captured = capsys.readouterr().out
+    assert "child-ready" in captured
+    assert "still running; granular progress unavailable" in captured
+    assert "test command: complete" in captured
+    assert "child-ready" in log_path.read_text()
 
 
 def test_runtime_validation_allows_one_batch_tail_without_throughput():

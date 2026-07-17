@@ -3,10 +3,12 @@
 import hashlib
 import json
 import os
+import queue
 import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import zipfile
 from dataclasses import dataclass
@@ -76,6 +78,12 @@ class ScoringContext:
 class TargetedDropoutRunner:
     def __init__(self, context: ScoringContext):
         self.context = context
+
+    def config_num_samples(self, config: Mapping[str, Any]) -> int:
+        num_samples = int(config.get("num_samples", self.context.num_samples))
+        if num_samples < 1:
+            raise ValueError(f"{config.get('config_id', '<unknown>')}: num_samples must be positive")
+        return num_samples
 
     @staticmethod
     def _config_types():
@@ -152,7 +160,7 @@ class TargetedDropoutRunner:
         cfg.model.residual_dropout = float(config["residual_dropout"])
         cfg.model.embedding_dropout = float(config["embedding_dropout"])
         cfg.uncertainty_scoring.enabled = True
-        cfg.uncertainty_scoring.num_samples = self.context.num_samples
+        cfg.uncertainty_scoring.num_samples = self.config_num_samples(config)
         cfg.uncertainty_scoring.perturbation_type = "dropout"
         cfg.uncertainty_scoring.coupled_masks = True
         cfg.restore_dataloader = False
@@ -179,13 +187,23 @@ class TargetedDropoutRunner:
         args: Sequence[Any],
         log_path: Path,
         cwd: Optional[Path] = None,
+        pythonpath_root: Optional[Path] = None,
+        heartbeat_seconds: float = 30.0,
+        label: str = "command",
     ) -> float:
+        if heartbeat_seconds <= 0:
+            raise ValueError("heartbeat_seconds must be positive")
         env = os.environ.copy()
-        olmo_dir = str(self.context.olmo_dir)
-        env["PYTHONPATH"] = olmo_dir + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+        code_root = str(pythonpath_root or self.context.olmo_dir)
+        env["PYTHONPATH"] = code_root + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+        env["PYTHONUNBUFFERED"] = "1"
         log_path = Path(log_path)
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        print("running:", " ".join(str(arg) for arg in args))
+        print(
+            f"{label}: starting; heartbeat every {heartbeat_seconds:g}s; log={log_path}",
+            flush=True,
+        )
+        print("running:", " ".join(str(arg) for arg in args), flush=True)
         start = time.perf_counter()
         with log_path.open("w", encoding="utf-8") as log:
             proc = subprocess.Popen(
@@ -198,15 +216,35 @@ class TargetedDropoutRunner:
                 bufsize=1,
             )
             assert proc.stdout is not None
-            for line in proc.stdout:
-                print(line, end="")
+            output_queue: queue.Queue[Optional[str]] = queue.Queue()
+
+            def pump_stdout() -> None:
+                for line in proc.stdout:
+                    output_queue.put(line)
+                output_queue.put(None)
+
+            threading.Thread(target=pump_stdout, daemon=True).start()
+            while True:
+                try:
+                    line = output_queue.get(timeout=heartbeat_seconds)
+                except queue.Empty:
+                    elapsed = time.perf_counter() - start
+                    message = f"{label}: still running; granular progress unavailable; elapsed={elapsed:.1f}s"
+                    print(message, flush=True)
+                    log.write(message + "\n")
+                    log.flush()
+                    continue
+                if line is None:
+                    break
+                print(line, end="", flush=True)
                 log.write(line)
+                log.flush()
             returncode = proc.wait()
         elapsed = time.perf_counter() - start
         if returncode != 0:
             tail = log_path.read_text(errors="ignore")[-4000:]
             raise RuntimeError(f"Command failed with code {returncode}. Log tail:\n{tail}")
-        print("elapsed_seconds:", round(elapsed, 2), "log:", log_path)
+        print(f"{label}: complete; elapsed_seconds={elapsed:.2f}; log={log_path}", flush=True)
         return elapsed
 
     @staticmethod
@@ -255,7 +293,7 @@ class TargetedDropoutRunner:
             "model_id": model_id,
             "checkpoint_identity": self.context.checkpoint_identities[model_id],
             "seed": self.context.seed,
-            "num_samples": self.context.num_samples,
+            "num_samples": self.config_num_samples(config),
             "coupled_masks": True,
             "global_batch_size": self.context.global_batch_size,
             "microbatch": int(microbatch),
@@ -271,7 +309,7 @@ class TargetedDropoutRunner:
     ) -> str:
         return canonical_sha256(self.shard_experiment_payload(config, model_id, shard, microbatch))
 
-    def score_prefix_is_finite(self, score_dir: Path, expected_rows: int) -> bool:
+    def score_prefix_is_finite(self, score_dir: Path, expected_rows: int, num_samples: int) -> bool:
         score_dir = Path(score_dir)
         files = [line.strip() for line in (score_dir / "files.txt").read_text().splitlines() if line.strip()]
         if len(files) != 1:
@@ -279,13 +317,13 @@ class TargetedDropoutRunner:
         score_path = Path(files[0])
         if not score_path.exists():
             score_path = score_dir / score_path.name
-        if not score_path.exists() or self.score_width(score_dir) != self.context.num_samples:
+        if not score_path.exists() or self.score_width(score_dir) != num_samples:
             return False
         scores = np.memmap(
             score_path,
             dtype=np.float32,
             mode="r",
-            shape=(self.context.file_seqs, self.context.num_samples),
+            shape=(self.context.file_seqs, num_samples),
         )
         return bool(np.isfinite(np.asarray(scores[:expected_rows])).all())
 
@@ -319,7 +357,11 @@ class TargetedDropoutRunner:
                 return False
             if values.min(initial=0) < 0 or values.max(initial=-1) >= self.context.stage_rows:
                 return False
-            return self.score_prefix_is_finite(score_dir, expected_rows)
+            return self.score_prefix_is_finite(
+                score_dir,
+                expected_rows,
+                self.config_num_samples(config),
+            )
         except Exception:
             return False
 
@@ -371,6 +413,7 @@ class TargetedDropoutRunner:
                 "--save_overwrite=true",
             ],
             log_path,
+            label=(f"score {config['config_id']} {model_id} " f"{int(shard['start'])}:{int(shard['end'])}"),
         )
         experiment = self.shard_experiment_payload(config, model_id, shard, microbatch)
         marker = {
@@ -380,7 +423,7 @@ class TargetedDropoutRunner:
             "start": int(shard["start"]),
             "end": int(shard["end"]),
             "rows": expected_rows,
-            "num_samples": self.context.num_samples,
+            "num_samples": self.config_num_samples(config),
             "microbatch": int(microbatch),
             "elapsed_seconds": elapsed,
             "producer_sha": self.context.producer_sha,
