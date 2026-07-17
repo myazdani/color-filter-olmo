@@ -560,6 +560,7 @@ class BroadDropoutSweep:
                         "tokens_per_second": runtime.get("tokens_per_second"),
                         "batches_per_second": runtime.get("batches_per_second"),
                         "peak_gpu_memory_mb": runtime.get("peak_gpu_memory_mb"),
+                        "global_batch_size": int(shard.get("batch_size", self.context.global_batch_size)),
                         "microbatch": marker.get("microbatch"),
                     }
                 )

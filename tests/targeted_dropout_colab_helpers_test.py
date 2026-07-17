@@ -218,6 +218,45 @@ def test_config_num_samples_override_must_be_positive(tmp_path):
         HELPERS.TargetedDropoutRunner(context).config_num_samples({"config_id": "bad", "num_samples": 0})
 
 
+def test_tail_shard_caps_microbatch_and_preserves_primary_tuple(tmp_path):
+    context = HELPERS.ScoringContext(
+        olmo_dir=tmp_path,
+        template_config=tmp_path / "template.yaml",
+        runtime_checkpoint_dir=tmp_path,
+        runtime_config_dir=tmp_path,
+        config_drive=tmp_path,
+        raw_score_drive=tmp_path,
+        stage_root=tmp_path,
+        subset_raw=tmp_path / "tokens.raw",
+        run_state_path=tmp_path / "state.json",
+        producer_sha="producer",
+        analysis_sha="analysis",
+        notebook_revision="test",
+        run_stage="test",
+        subset_id="test",
+        subset_fingerprint="subset",
+        runtime_identity={},
+        checkpoint_identities={"prior": {}},
+        seed=1,
+        num_samples=1,
+        global_batch_size=2048,
+        stage_rows=500000,
+        shard_rows=24576,
+        file_seqs=500000,
+    )
+    runner = HELPERS.TargetedDropoutRunner(context)
+    primary = {"start": 0, "end": 24576, "rows": 24576, "data_start_step": 0, "batch_size": 2048}
+    tail = {"start": 499712, "end": 500000, "rows": 288, "data_start_step": 15616, "batch_size": 32}
+
+    assert runner.effective_microbatch(primary, 1024) == 1024
+    assert runner.effective_microbatch(tail, 1024) == 32
+
+    payload = runner.shard_experiment_payload({"config_id": "control"}, "prior", tail, 1024)
+
+    assert payload["global_batch_size"] == 32
+    assert payload["microbatch"] == 32
+
+
 def test_run_logged_streams_output_and_emits_heartbeat(tmp_path, capsys):
     context = HELPERS.ScoringContext(
         olmo_dir=tmp_path,
@@ -277,6 +316,7 @@ def test_runtime_validation_allows_one_batch_tail_without_throughput():
                 "tokens_per_second": None,
                 "batches_per_second": None,
                 "peak_gpu_memory_mb": 3216.0,
+                "global_batch_size": 32,
                 "microbatch": 32,
             },
         ],

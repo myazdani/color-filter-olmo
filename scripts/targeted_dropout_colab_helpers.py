@@ -145,8 +145,9 @@ class TargetedDropoutRunner:
     ):
         rows = int(shard["rows"])
         batch_size = int(shard.get("batch_size", self.context.global_batch_size))
-        if rows % batch_size != 0 or int(microbatch) > batch_size:
-            raise ValueError(f"Invalid scoring batch tuple: rows={rows}, batch={batch_size}, microbatch={microbatch}")
+        effective_microbatch = self.effective_microbatch(shard, microbatch)
+        if rows % batch_size != 0:
+            raise ValueError(f"Invalid scoring batch tuple: rows={rows}, batch={batch_size}")
         cfg = self.load_checkpoint_score_config(checkpoint_path)
         cfg.run_name = f"{config['config_id']}_{model_id}_{int(shard['start']):06d}_{int(shard['end']):06d}"
         cfg.save_folder = str(output_dir)
@@ -156,7 +157,7 @@ class TargetedDropoutRunner:
         cfg.data_start_step = int(shard["data_start_step"])
         cfg.global_train_batch_size = batch_size
         cfg.device_train_batch_size = batch_size
-        cfg.device_train_microbatch_size = int(microbatch)
+        cfg.device_train_microbatch_size = effective_microbatch
         cfg.data.paths = [str(self.context.subset_raw)]
         cfg.data.memmap_dtype = "uint32"
         cfg.data.num_workers = 0
@@ -175,6 +176,14 @@ class TargetedDropoutRunner:
         cfg.gen1_gc_interval = 50
         cfg.save_data_indices = True
         return cfg
+
+    def effective_microbatch(self, shard: Mapping[str, int], microbatch: int) -> int:
+        """Keep fallback tail shards valid without changing the primary batch tuple."""
+        batch_size = int(shard.get("batch_size", self.context.global_batch_size))
+        requested_microbatch = int(microbatch)
+        if requested_microbatch <= 0:
+            raise ValueError(f"Microbatch must be positive: {requested_microbatch}")
+        return min(requested_microbatch, batch_size)
 
     def write_config(self, cfg: Any, name: str) -> Path:
         OmegaConf, TrainConfig = self._config_types()
@@ -301,7 +310,7 @@ class TargetedDropoutRunner:
             "num_samples": self.config_num_samples(config),
             "coupled_masks": True,
             "global_batch_size": int(shard.get("batch_size", self.context.global_batch_size)),
-            "microbatch": int(microbatch),
+            "microbatch": self.effective_microbatch(shard, microbatch),
             "shard": {key: int(value) for key, value in shard.items()},
         }
 
@@ -429,7 +438,7 @@ class TargetedDropoutRunner:
             "end": int(shard["end"]),
             "rows": expected_rows,
             "num_samples": self.config_num_samples(config),
-            "microbatch": int(microbatch),
+            "microbatch": self.effective_microbatch(shard, microbatch),
             "elapsed_seconds": elapsed,
             "producer_sha": self.context.producer_sha,
             "runtime_metrics": self.parse_score_log_metrics(log_path),
@@ -818,7 +827,8 @@ def validate_runtime_records(
             saw_multi_batch = True
             if tokens_per_second is None or batches_per_second is None:
                 raise RuntimeError("Incomplete throughput metrics for a multi-batch shard")
-        if int(record["microbatch"]) != expected_microbatch:
+        effective_microbatch = min(expected_microbatch, int(record.get("global_batch_size", global_batch_size)))
+        if int(record["microbatch"]) != effective_microbatch:
             raise RuntimeError("Inconsistent runtime microbatch records")
     if not saw_multi_batch:
         raise RuntimeError("At least one multi-batch runtime record is required")
@@ -1338,6 +1348,7 @@ class TargetedDropoutWorkflow:
                         "tokens_per_second": runtime.get("tokens_per_second"),
                         "batches_per_second": runtime.get("batches_per_second"),
                         "peak_gpu_memory_mb": runtime.get("peak_gpu_memory_mb"),
+                        "global_batch_size": int(shard.get("batch_size", self.context.global_batch_size)),
                         "microbatch": marker.get("microbatch"),
                     }
                 )
