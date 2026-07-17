@@ -144,15 +144,18 @@ class TargetedDropoutRunner:
         console_log_interval: int = 25,
     ):
         rows = int(shard["rows"])
+        batch_size = int(shard.get("batch_size", self.context.global_batch_size))
+        if rows % batch_size != 0 or int(microbatch) > batch_size:
+            raise ValueError(f"Invalid scoring batch tuple: rows={rows}, batch={batch_size}, microbatch={microbatch}")
         cfg = self.load_checkpoint_score_config(checkpoint_path)
         cfg.run_name = f"{config['config_id']}_{model_id}_{int(shard['start']):06d}_{int(shard['end']):06d}"
         cfg.save_folder = str(output_dir)
         cfg.load_path = str(self.prepare_model_only_checkpoint(checkpoint_path))
         cfg.load_checkpoint_type = "unsharded"
-        cfg.max_duration = rows // self.context.global_batch_size
+        cfg.max_duration = rows // batch_size
         cfg.data_start_step = int(shard["data_start_step"])
-        cfg.global_train_batch_size = self.context.global_batch_size
-        cfg.device_train_batch_size = self.context.global_batch_size
+        cfg.global_train_batch_size = batch_size
+        cfg.device_train_batch_size = batch_size
         cfg.device_train_microbatch_size = int(microbatch)
         cfg.data.paths = [str(self.context.subset_raw)]
         cfg.data.memmap_dtype = "uint32"
@@ -297,7 +300,7 @@ class TargetedDropoutRunner:
             "seed": self.context.seed,
             "num_samples": self.config_num_samples(config),
             "coupled_masks": True,
-            "global_batch_size": self.context.global_batch_size,
+            "global_batch_size": int(shard.get("batch_size", self.context.global_batch_size)),
             "microbatch": int(microbatch),
             "shard": {key: int(value) for key, value in shard.items()},
         }
@@ -764,23 +767,29 @@ def build_shard_plan(
     global_batch_size: int,
     output_path: Optional[Path] = None,
 ) -> Sequence[Dict[str, int]]:
-    if shard_rows % global_batch_size != 0 or stage_rows % global_batch_size != 0:
-        raise ValueError("Stage and shard rows must be divisible by the global batch size")
+    if shard_rows % global_batch_size != 0:
+        raise ValueError("Shard rows must be divisible by the global batch size")
     shards = []
     start = 0
-    while start < stage_rows:
-        rows = min(shard_rows, stage_rows - start)
-        if rows % global_batch_size != 0:
-            raise ValueError(f"Final shard is not batch aligned: start={start}, rows={rows}")
+    primary_rows = stage_rows - (stage_rows % global_batch_size)
+    while start < primary_rows:
+        rows = min(shard_rows, primary_rows - start)
         shards.append(
             {
                 "start": start,
                 "end": start + rows,
                 "rows": rows,
                 "data_start_step": start // global_batch_size,
+                "batch_size": global_batch_size,
             }
         )
         start += rows
+    if start < stage_rows:
+        tail_rows = stage_rows - start
+        if tail_rows % 32 != 0:
+            raise ValueError(f"Tail shard is not aligned to the 32-row fallback: rows={tail_rows}")
+        shards.append({"start": start, "end": stage_rows, "rows": tail_rows,
+                       "data_start_step": start // 32, "batch_size": 32})
     if output_path is not None:
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)

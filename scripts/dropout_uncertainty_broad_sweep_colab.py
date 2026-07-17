@@ -7,7 +7,7 @@ import json
 import shutil
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Sequence
@@ -16,8 +16,10 @@ import numpy as np
 
 from scripts.targeted_dropout_colab_helpers import (
     TargetedDropoutRunner,
+    build_shard_plan,
     canonical_sha256,
     create_verified_archive,
+    select_fastest_benchmark,
     validate_runtime_records,
     verify_bundle_archive,
 )
@@ -207,28 +209,52 @@ class BroadDropoutSweep:
             raise RuntimeError(f"Zero-dropout smoke gate failed: Spearman={spearman:.6f}, Pearson={pearson:.6f}")
         return {"rows": smoke_rows, "spearman": spearman, "pearson": pearson, "mean_mc_std": 0.0}
 
-    def benchmark(self, benchmark_rows: int, candidates: Sequence[int]) -> Dict[str, Any]:
-        config = self.config_by_rate(max(REQUESTED_RATES))
-        shard = {"start": 0, "end": benchmark_rows, "rows": benchmark_rows, "data_start_step": 0}
-        root = self.context.stage_root / "_smoke_and_benchmark" / "benchmark" / str(config["config_id"])
-        results, selected = self.runner.benchmark_microbatches(
-            config,
-            "prior",
-            self.context.prior_checkpoint,
-            root,
-            shard,
-            candidates,
-            self.context.seq_len,
+    def configure_batch(self, global_batch_size: int, microbatch: int) -> None:
+        shard_rows = (self.context.shard_rows // global_batch_size) * global_batch_size
+        shards = build_shard_plan(self.context.rows, shard_rows, global_batch_size)
+        runner = TargetedDropoutRunner(replace(
+            self.runner.context, global_batch_size=global_batch_size, shard_rows=shard_rows
+        ))
+        self.context = replace(
+            self.context, runner=runner, shards=shards, global_batch_size=global_batch_size,
+            shard_rows=shard_rows, microbatch=microbatch,
         )
+
+    def benchmark(self, benchmark_rows: int, candidates: Sequence[Sequence[int]]) -> Dict[str, Any]:
+        config = self.config_by_rate(max(REQUESTED_RATES))
+        root = self.context.stage_root / "_smoke_and_benchmark" / "benchmark" / str(config["config_id"])
+        results = []
+        for global_batch_size, microbatch in candidates:
+            global_batch_size, microbatch = int(global_batch_size), int(microbatch)
+            if benchmark_rows % global_batch_size or microbatch > global_batch_size:
+                raise ValueError(f"Invalid benchmark tuple: {(global_batch_size, microbatch)}")
+            shard = {"start": 0, "end": benchmark_rows, "rows": benchmark_rows,
+                     "data_start_step": 0, "batch_size": global_batch_size}
+            output = root / f"prior_batch_{global_batch_size}_microbatch_{microbatch}"
+            try:
+                score = self.runner.run_score_once(config, "prior", self.context.prior_checkpoint, output, shard, microbatch, 1)
+                marker = json.loads((output / "completed.json").read_text())
+                throughput = float(marker["runtime_metrics"]["tokens_per_second"])
+                results.append({"global_batch_size": global_batch_size, "microbatch": microbatch,
+                                "tokens_per_second": throughput, "elapsed_seconds": marker["elapsed_seconds"],
+                                "rows": benchmark_rows, "tokens": benchmark_rows * self.context.seq_len,
+                                "peak_gpu_memory_mb": marker["runtime_metrics"].get("peak_gpu_memory_mb"),
+                                "status": "ok", "output": str(score)})
+            except Exception as exc:
+                results.append({"global_batch_size": global_batch_size, "microbatch": microbatch,
+                                "status": f"failed: {exc}"})
+                print("stopping after first failed batch tuple", flush=True)
+                break
+        selected = select_fastest_benchmark(results)
+        selected_batch = int(selected["global_batch_size"])
         selected_microbatch = int(selected["microbatch"])
-        if selected_microbatch not in candidates:
-            raise RuntimeError(f"Unexpected selected microbatch: {selected_microbatch}")
+        self.configure_batch(selected_batch, selected_microbatch)
         benchmark_tps = float(selected["tokens_per_second"])
         jobs = len(self.context.configs) * 2 * len(self.context.shards)
         conservative_tokens = len(self.context.configs) * 2 * self.context.rows * self.context.seq_len
         estimated_seconds = conservative_tokens / benchmark_tps
         state = {
-            "schema_version": 3,
+            "schema_version": 4,
             "created_utc": datetime.now(timezone.utc).isoformat(),
             "producer_sha": self.context.producer_sha,
             "analysis_sha": self.context.analysis_sha,
@@ -236,6 +262,7 @@ class BroadDropoutSweep:
             "subset_fingerprint": self.runner.context.subset_fingerprint,
             "config_fingerprint": canonical_sha256({"configs": [dict(item) for item in self.context.configs]}),
             "microbatch": selected_microbatch,
+            "global_batch_size": selected_batch,
             "shard_rows": self.context.shard_rows,
             "benchmark": selected,
             "benchmark_results": results,
@@ -256,15 +283,17 @@ class BroadDropoutSweep:
             raise FileNotFoundError(self.context.run_state_path)
         state = json.loads(self.context.run_state_path.read_text())
         expected = {
-            "schema_version": 3,
+            "schema_version": 4,
             "producer_sha": self.context.producer_sha,
             "subset_fingerprint": self.runner.context.subset_fingerprint,
             "config_fingerprint": canonical_sha256({"configs": [dict(item) for item in self.context.configs]}),
             "shard_rows": self.context.shard_rows,
+            "global_batch_size": self.context.global_batch_size,
         }
         mismatches = {key: (state.get(key), value) for key, value in expected.items() if state.get(key) != value}
         if mismatches:
             raise RuntimeError(f"Persisted run state does not match the sweep: {mismatches}")
+        self.configure_batch(int(state["global_batch_size"]), int(state["microbatch"]))
         return int(state["microbatch"])
 
     def raw_status(self, microbatch: Optional[int] = None) -> Sequence[Dict[str, Any]]:
