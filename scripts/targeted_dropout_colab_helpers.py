@@ -127,8 +127,10 @@ class TargetedDropoutRunner:
         cfg.model = checkpoint_cfg.model
         if "tokenizer" in checkpoint_cfg:
             cfg.tokenizer = checkpoint_cfg.tokenizer
-        if "targeted_ladder" in cfg:
-            del cfg["targeted_ladder"]
+        # Sweep directives describe config generation, not TrainConfig fields.
+        for template_only_key in ("targeted_ladder", "sweep"):
+            if template_only_key in cfg:
+                del cfg[template_only_key]
         return cfg
 
     def build_score_config(

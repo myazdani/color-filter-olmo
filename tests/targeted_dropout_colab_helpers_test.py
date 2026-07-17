@@ -49,6 +49,56 @@ def test_select_fastest_benchmark_requires_valid_throughput():
         HELPERS.select_fastest_benchmark([{"microbatch": 16, "status": "ok", "tokens_per_second": None}])
 
 
+def test_score_config_removes_template_only_sweep_directives(tmp_path):
+    class Config(dict):
+        __getattr__ = dict.__getitem__
+
+        def __setattr__(self, key, value):
+            self[key] = value
+
+    class FakeOmegaConf:
+        @staticmethod
+        def load(path):
+            if Path(path).parent.name == "checkpoint":
+                return Config(model=Config(name="checkpoint-model"), tokenizer=Config(name="tokenizer"))
+            return Config(model=Config(name="template-model"), targeted_ladder=[], sweep=[])
+
+    context = HELPERS.ScoringContext(
+        olmo_dir=tmp_path,
+        template_config=tmp_path / "template.yaml",
+        runtime_checkpoint_dir=tmp_path,
+        runtime_config_dir=tmp_path,
+        config_drive=tmp_path,
+        raw_score_drive=tmp_path,
+        stage_root=tmp_path,
+        subset_raw=tmp_path / "tokens.raw",
+        run_state_path=tmp_path / "state.json",
+        producer_sha="producer",
+        analysis_sha="analysis",
+        notebook_revision="test",
+        run_stage="test",
+        subset_id="test",
+        subset_fingerprint="subset",
+        runtime_identity={},
+        checkpoint_identities={},
+        seed=1,
+        num_samples=1,
+        global_batch_size=1,
+        stage_rows=1,
+        shard_rows=1,
+        file_seqs=1,
+    )
+    runner = HELPERS.TargetedDropoutRunner(context)
+    runner._config_types = lambda: (FakeOmegaConf, object)
+
+    config = runner.load_checkpoint_score_config(tmp_path / "checkpoint")
+
+    assert config.model.name == "checkpoint-model"
+    assert config.tokenizer.name == "tokenizer"
+    assert "targeted_ladder" not in config
+    assert "sweep" not in config
+
+
 def test_shard_payload_preserves_resume_contract(tmp_path):
     context = HELPERS.ScoringContext(
         olmo_dir=tmp_path,
