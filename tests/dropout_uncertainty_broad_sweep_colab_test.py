@@ -134,6 +134,8 @@ def test_notebook_compiles_and_declares_hardened_sweep_contract():
     assert "checkout_exact(PRODUCER_DIR, PRODUCER_SHA)" in source
     assert "checkout_exact(ANALYSIS_DIR, ANALYSIS_SHA)" in source
     assert "analysis_olmo_dir=ANALYSIS_DIR" in source
+    assert "'gpu_name': torch.cuda.get_device_name(0)" in source
+    assert "'gpu_total_memory_bytes': int(gpu.total_memory)" in source
     assert "pythonpath_root=self.context.analysis_olmo_dir" in HELPER_PATH.read_text()
     assert 'self.analysis_script_dir / "21_dropout_uncertainty_metrics.py"' in HELPER_PATH.read_text()
     assert "metadata_and_full_scores_indexed_by_score_index" in source
