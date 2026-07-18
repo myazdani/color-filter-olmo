@@ -26,6 +26,12 @@ from scripts.targeted_dropout_colab_helpers import (
 
 
 REQUESTED_RATES = (0.0, 0.00001, 0.001, 0.01)
+FIXED_REFERENCE_ALIGNMENT_CONTRACTS = frozenset(
+    {
+        "metadata_and_full_scores_indexed_by_score_index",
+        "legacy_reference_arrays_indexed_by_score_index",
+    }
+)
 
 
 def validate_sweep_configs(configs: Sequence[Mapping[str, Any]]) -> None:
@@ -640,7 +646,7 @@ class BroadDropoutSweep:
             manifest = json.loads(reference_manifest.read_text())
             if (
                 manifest.get("rows") != self.context.rows
-                or manifest.get("row_alignment") != "metadata_and_full_scores_indexed_by_score_index"
+                or manifest.get("row_alignment") not in FIXED_REFERENCE_ALIGNMENT_CONTRACTS
             ):
                 raise ValueError("The p=0.05 reference does not use the corrected full-pool alignment")
             with np.load(reference_npz, allow_pickle=False) as raw:

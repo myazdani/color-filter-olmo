@@ -59,6 +59,13 @@ def test_finite_sample_std_handles_k1_without_nan():
     assert np.array_equal(HELPER.finite_sample_std(samples), np.zeros(2, dtype=np.float32))
 
 
+def test_reference_alignment_contracts_accept_both_corrected_formats():
+    assert HELPER.FIXED_REFERENCE_ALIGNMENT_CONTRACTS == {
+        "metadata_and_full_scores_indexed_by_score_index",
+        "legacy_reference_arrays_indexed_by_score_index",
+    }
+
+
 def test_validate_raw_grid_requires_matching_complete_permutations(tmp_path):
     configs = sweep_configs()
     shards = [
