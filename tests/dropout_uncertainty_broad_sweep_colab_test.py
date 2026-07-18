@@ -10,8 +10,8 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 HELPER_PATH = ROOT / "scripts" / "dropout_uncertainty_broad_sweep_colab.py"
 NOTEBOOK_PATH = ROOT / "notebooks" / "dropout_uncertainty_broad_rate_sweep_colab.ipynb"
-PINNED_PRODUCER_SHA = "a8881e0af54860b5089211c5fd8f1f929d685680"
-PINNED_ANALYSIS_SHA = "a8881e0af54860b5089211c5fd8f1f929d685680"
+PINNED_PRODUCER_SHA = "7d19d836bc48a6ca76621558d5a339ad030af284"
+PINNED_ANALYSIS_SHA = "afe9db7b62bf17dab38ee4a51395e40adcb2dfea"
 SPEC = importlib.util.spec_from_file_location("dropout_uncertainty_broad_sweep_colab", HELPER_PATH)
 assert SPEC is not None and SPEC.loader is not None
 HELPER = importlib.util.module_from_spec(SPEC)
