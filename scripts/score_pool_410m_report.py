@@ -21,6 +21,10 @@ DEFAULT_RUN_IDS = (
     "hard_positive_oracle_100k",
     "hard_pair_cascade_100k",
     "hard_union_control_100k",
+    "hard_pair_mid2_only_100k",
+    "hard_dropout_embed_p000001_conservative_100k",
+    "hard_dropout_embed_p0005_conservative_100k",
+    "hard_dropout_embed_p001_conservative_100k",
 )
 
 RUN_LABELS = {
@@ -30,6 +34,10 @@ RUN_LABELS = {
     "hard_positive_oracle_100k": "Hard positive-only baseline",
     "hard_pair_cascade_100k": "Hard PN cascade",
     "hard_union_control_100k": "Hard PN mixture control",
+    "hard_pair_mid2_only_100k": "Hard PN pair-mid2-only",
+    "hard_dropout_embed_p000001_conservative_100k": "Hard PN embedding-dropout LCB p=1e-5",
+    "hard_dropout_embed_p0005_conservative_100k": "Hard PN embedding-dropout LCB p=0.005",
+    "hard_dropout_embed_p001_conservative_100k": "Hard PN embedding-dropout LCB p=0.01",
 }
 
 RUN_GROUPS = {
@@ -47,6 +55,10 @@ RUN_GROUPS = {
             "hard_positive_oracle_100k",
             "hard_pair_cascade_100k",
             "hard_union_control_100k",
+            "hard_pair_mid2_only_100k",
+            "hard_dropout_embed_p000001_conservative_100k",
+            "hard_dropout_embed_p0005_conservative_100k",
+            "hard_dropout_embed_p001_conservative_100k",
         ),
     },
 }
@@ -712,6 +724,17 @@ def write_report(
         (
             "- `hard_union_control_100k` (Hard PN mixture control): random 100K rows "
             "from `hard_positive union hard_negative`."
+        ),
+        (
+            "- `hard_pair_mid2_only_100k` (Hard PN pair-mid2-only): choose the lowest 100K "
+            "`pair_mid2` scores directly from `hard_positive union hard_negative`, with no full rerank."
+        ),
+        (
+            "- `hard_dropout_embed_p000001_conservative_100k`, "
+            "`hard_dropout_embed_p0005_conservative_100k`, and "
+            "`hard_dropout_embed_p001_conservative_100k` (Hard PN embedding-dropout LCB): "
+            "choose the lowest 100K `mean_color + std_color` scores from the hard union at "
+            "embedding dropout rates `1e-5`, `0.005`, and `0.01`, respectively."
         ),
         *(
             [
