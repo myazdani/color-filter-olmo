@@ -79,11 +79,42 @@ def selection_diagnostic(selected: pd.DataFrame, run_id: str, policy: str, score
     }
 
 
+def resolve_summary_dropout_rate(summary: pd.DataFrame, *, target: str) -> float:
+    target_column = f"{target}_dropout"
+    if target_column not in summary.columns:
+        raise ValueError(f"Summary is missing target-specific rate column: {target_column}")
+
+    generic_rates = summary["dropout_rate"].dropna().astype(float).unique()
+    target_rates = summary[target_column].dropna().astype(float).unique()
+    if len(target_rates) != 1 or not math.isfinite(float(target_rates[0])):
+        raise ValueError(f"Expected one finite {target_column} value, found {target_rates}")
+    resolved = float(target_rates[0])
+    if len(generic_rates) > 1:
+        raise ValueError(f"Expected at most one generic dropout_rate value, found {generic_rates}")
+    if len(generic_rates) == 1 and not math.isclose(
+        float(generic_rates[0]), resolved, rel_tol=0.0, abs_tol=1e-12
+    ):
+        raise ValueError(
+            f"Generic dropout_rate={generic_rates[0]} disagrees with {target_column}={resolved}"
+        )
+    return resolved
+
+
 def validate_dropout_summary(path: Path, *, run_id: str, expected_rate: float, metadata: pd.DataFrame) -> pd.DataFrame:
     if not path.is_file():
         raise FileNotFoundError(path)
     summary = pd.read_parquet(path)
-    required = {"seq_idx", "pool_name", "score_mean", "std_color", "score_conservative", "dropout_rate", "dropout_target", "num_samples"}
+    required = {
+        "seq_idx",
+        "pool_name",
+        "score_mean",
+        "std_color",
+        "score_conservative",
+        "dropout_rate",
+        "dropout_target",
+        "embedding_dropout",
+        "num_samples",
+    }
     missing = sorted(required - set(summary.columns))
     if missing:
         raise ValueError(f"{path} missing required columns: {missing}")
@@ -95,9 +126,9 @@ def validate_dropout_summary(path: Path, *, run_id: str, expected_rate: float, m
         raise ValueError(f"{run_id}: expected embedding-only dropout")
     if set(summary["num_samples"].astype(int)) != {8}:
         raise ValueError(f"{run_id}: expected K=8")
-    rates = summary["dropout_rate"].astype(float).unique()
-    if len(rates) != 1 or not math.isclose(float(rates[0]), expected_rate, rel_tol=0.0, abs_tol=1e-12):
-        raise ValueError(f"{run_id}: expected dropout rate {expected_rate}, found {rates}")
+    resolved_rate = resolve_summary_dropout_rate(summary, target="embedding")
+    if not math.isclose(resolved_rate, expected_rate, rel_tol=0.0, abs_tol=1e-12):
+        raise ValueError(f"{run_id}: expected dropout rate {expected_rate}, found {resolved_rate}")
     conservative = summary["score_mean"].astype(float) + summary["std_color"].astype(float)
     if not np.allclose(conservative, summary["score_conservative"].astype(float), rtol=1e-5, atol=1e-6):
         raise ValueError(f"{run_id}: score_conservative is not mean_color + std_color")
