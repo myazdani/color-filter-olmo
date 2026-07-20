@@ -89,6 +89,20 @@ FIGURES = (
     "selected_set_overlap_hard_source.png",
 )
 
+DEFAULT_C4_PROXY_NOTE = (
+    "Fixed public C4 validation proxy; original downstream_data has no c4_val memmap."
+)
+
+
+def c4_proxy_note(manifest: dict[str, object]) -> str:
+    c4_manifest = manifest["c4_val_proxy"]
+    if not isinstance(c4_manifest, dict):
+        raise TypeError("c4_val_proxy manifest entry must be an object")
+    note = c4_manifest.get("note")
+    if isinstance(note, str) and note.strip():
+        return note.strip()
+    return DEFAULT_C4_PROXY_NOTE
+
 
 def run_seed(run_id: str) -> int | None:
     match = re.match(r"^(.+)_seed(\d+)_100k$", run_id)
@@ -703,7 +717,7 @@ def write_report(
         f"- Eval data: `{eval_manifest_path.parent}`",
         f"- Books eval source: `{manifest['books_val']['source']}`",
         f"- C4 eval source: `{manifest['c4_val_proxy']['source']}`",
-        f"- C4 caveat: {manifest['c4_val_proxy']['note']}",
+        f"- C4 caveat: {c4_proxy_note(manifest)}",
         "",
         "## Mini-Universe Definitions",
         "",
