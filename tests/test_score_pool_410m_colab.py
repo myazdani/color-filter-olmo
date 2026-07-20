@@ -13,10 +13,13 @@ if str(SCRIPTS) not in sys.path:
 
 from score_pool_410m_colab import (  # noqa: E402
     BundleContext,
+    DropoutSourceContext,
     build_bundle,
+    dropout_source_configs,
     parse_microbatch_results,
     production_log_status,
     run_logged,
+    validate_dropout_source_context,
     validate_smoke_logs,
     verify_bundle,
 )
@@ -85,6 +88,61 @@ def test_smoke_validation_accepts_complete_finite_log(tmp_path: Path) -> None:
         "Training complete\n"
     )
     validate_smoke_logs(["run"], tmp_path)
+
+
+def test_dropout_source_configs_cover_requested_embedding_rates() -> None:
+    configs = dropout_source_configs()
+    assert [config["config_id"] for config in configs] == [
+        "dropout_embed_p000001",
+        "dropout_embed_p0005",
+        "dropout_embed_p001",
+    ]
+    assert [config["embedding_dropout"] for config in configs] == [1e-5, 0.005, 0.01]
+    assert {config["dropout_target"] for config in configs} == {"embedding"}
+
+
+def test_dropout_source_configs_reject_unknown_run_id() -> None:
+    with pytest.raises(ValueError, match="Unknown dropout source"):
+        dropout_source_configs(["unknown"])
+
+
+def _dropout_context(tmp_path: Path, **overrides) -> DropoutSourceContext:
+    values = {
+        "drive_root": tmp_path / "drive",
+        "olmo_dir": tmp_path / "olmo",
+        "staging_paths": {
+            run_id: tmp_path / f"{run_id}.parquet"
+            for run_id in (
+                "hard_dropout_embed_p000001_conservative_100k",
+                "hard_dropout_embed_p0005_conservative_100k",
+                "hard_dropout_embed_p001_conservative_100k",
+            )
+        },
+        "producer_sha": "a" * 40,
+        "notebook_revision": "b" * 40,
+        "runtime_identity": {"gpu_name": "NVIDIA A100-SXM4-80GB"},
+    }
+    values.update(overrides)
+    return DropoutSourceContext(**values)
+
+
+def test_dropout_source_context_accepts_e2e_defaults(tmp_path: Path) -> None:
+    validate_dropout_source_context(_dropout_context(tmp_path))
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"staging_paths": {}}, "exactly the three"),
+        ({"num_samples": 4}, "K=8"),
+        ({"global_batch_size": 2048}, "global_batch_size=32"),
+        ({"smoke_rows": 31}, "smoke_rows"),
+        ({"runtime_identity": {}}, "runtime_identity"),
+    ],
+)
+def test_dropout_source_context_rejects_incompatible_run(tmp_path: Path, overrides: dict, message: str) -> None:
+    with pytest.raises(ValueError, match=message):
+        validate_dropout_source_context(_dropout_context(tmp_path, **overrides))
 
 
 def _write(path: Path, value: str = "x") -> None:

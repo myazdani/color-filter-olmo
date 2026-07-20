@@ -13,10 +13,11 @@ import statistics
 import subprocess
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from queue import Empty, Queue
 from threading import Thread
-from typing import Iterable, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 from zipfile import ZIP_DEFLATED, ZipFile
 
 
@@ -24,6 +25,23 @@ EXPECTED_ROWS = 100_000
 SEQUENCE_LENGTH = 512
 TOKENS_PER_RUN = 102_236_160
 DEFAULT_GLOBAL_BATCH_SIZE = 256
+DROPOUT_SOURCE_SPECS = (
+    {
+        "run_id": "hard_dropout_embed_p000001_conservative_100k",
+        "config_id": "dropout_embed_p000001",
+        "dropout_rate": 1e-5,
+    },
+    {
+        "run_id": "hard_dropout_embed_p0005_conservative_100k",
+        "config_id": "dropout_embed_p0005",
+        "dropout_rate": 0.005,
+    },
+    {
+        "run_id": "hard_dropout_embed_p001_conservative_100k",
+        "config_id": "dropout_embed_p001",
+        "dropout_rate": 0.01,
+    },
+)
 
 
 @dataclass(frozen=True)
@@ -44,12 +62,423 @@ class BundleContext:
     notebook_revision: str
 
 
+@dataclass(frozen=True)
+class DropoutSourceContext:
+    drive_root: Path
+    olmo_dir: Path
+    staging_paths: Mapping[str, Path]
+    producer_sha: str
+    notebook_revision: str
+    runtime_identity: Mapping[str, Any]
+    global_batch_size: int = 32
+    shard_rows: int = 24_992
+    num_samples: int = 8
+    seed: int = 1
+    initial_microbatch: int = 16
+    smoke_rows: int = 320
+    benchmark_rows: int = 640
+    tau64_cutoff: float = 0.3513622284
+    file_seqs: int = 1_048_576
+
+
 def source_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def dropout_source_configs(run_ids: Iterable[str] | None = None) -> list[dict[str, object]]:
+    selected = set(run_ids) if run_ids is not None else {spec["run_id"] for spec in DROPOUT_SOURCE_SPECS}
+    known = {spec["run_id"] for spec in DROPOUT_SOURCE_SPECS}
+    if unknown := sorted(selected - known):
+        raise ValueError(f"Unknown dropout source run IDs: {unknown}")
+    return [
+        {
+            "config_id": spec["config_id"],
+            "dropout_target": "embedding",
+            "attention_dropout": 0.0,
+            "residual_dropout": 0.0,
+            "embedding_dropout": spec["dropout_rate"],
+            "purpose": f"Score-pool embedding-only source for {spec['run_id']}",
+        }
+        for spec in DROPOUT_SOURCE_SPECS
+        if spec["run_id"] in selected
+    ]
+
+
+def validate_dropout_source_context(context: DropoutSourceContext) -> None:
+    expected_run_ids = {str(spec["run_id"]) for spec in DROPOUT_SOURCE_SPECS}
+    actual_run_ids = set(context.staging_paths)
+    if actual_run_ids != expected_run_ids:
+        raise ValueError(
+            "Dropout staging paths must cover exactly the three source run IDs; "
+            f"missing={sorted(expected_run_ids - actual_run_ids)}, "
+            f"extra={sorted(actual_run_ids - expected_run_ids)}"
+        )
+    if context.num_samples != 8:
+        raise ValueError(f"Dropout LCB sources require K=8, got {context.num_samples}")
+    if context.global_batch_size != 32:
+        raise ValueError(
+            "The full-pool scoring contract requires global_batch_size=32, " f"got {context.global_batch_size}"
+        )
+    if context.shard_rows <= 0 or context.shard_rows % context.global_batch_size != 0:
+        raise ValueError("shard_rows must be positive and divisible by global_batch_size")
+    for label, rows in (("smoke_rows", context.smoke_rows), ("benchmark_rows", context.benchmark_rows)):
+        if rows <= context.global_batch_size or rows % context.global_batch_size != 0:
+            raise ValueError(
+                f"{label} must be a bounded multi-batch multiple of {context.global_batch_size}, got {rows}"
+            )
+    if context.initial_microbatch not in (16, 32):
+        raise ValueError(f"initial_microbatch must be 16 or 32, got {context.initial_microbatch}")
+    if not context.runtime_identity:
+        raise ValueError("runtime_identity must be recorded before dropout source scoring")
+
+
+def discover_valid_dropout_sources(context: DropoutSourceContext) -> dict[str, Path]:
+    import pandas as pd
+    import pyarrow.parquet as parquet
+
+    try:
+        from build_score_pool_extra_training_sets import validate_dropout_summary
+    except ModuleNotFoundError:
+        from scripts.build_score_pool_extra_training_sets import validate_dropout_summary
+
+    metadata_path = context.drive_root / "data" / "score_pool_meta_official_500k.parquet"
+    if not metadata_path.is_file():
+        raise FileNotFoundError(metadata_path)
+    metadata = pd.read_parquet(metadata_path)
+    if len(metadata) != 500_000:
+        raise ValueError(f"Official score-pool metadata has {len(metadata):,} rows")
+
+    results_root = context.drive_root / "results"
+    dedicated_root = results_root / "score-pool-embedding-dropout-sources-500k"
+    candidates: list[Path] = list(context.staging_paths.values())
+    candidates.extend(
+        dedicated_root / str(spec["config_id"]) / "analysis" / "color_distribution_summary.parquet"
+        for spec in DROPOUT_SOURCE_SPECS
+    )
+    if results_root.exists():
+        candidates.extend(results_root.rglob("color_distribution_summary.parquet"))
+
+    required_metadata_columns = {
+        "dropout_target",
+        "dropout_rate",
+        "embedding_dropout",
+        "num_samples",
+    }
+    ordered_candidates = list(dict.fromkeys(Path(path) for path in candidates))
+    found: dict[str, Path] = {}
+    for path in ordered_candidates:
+        if not path.is_file():
+            continue
+        try:
+            file = parquet.ParquetFile(path)
+            if file.metadata.num_rows != len(metadata):
+                continue
+            if not required_metadata_columns.issubset(file.schema_arrow.names):
+                continue
+            attrs = pd.read_parquet(path, columns=sorted(required_metadata_columns))
+            targets = set(attrs["dropout_target"].dropna().astype(str).unique())
+            samples = set(attrs["num_samples"].dropna().astype(int).unique())
+            rates = attrs["embedding_dropout"].dropna().astype(float).unique()
+            if targets != {"embedding"} or samples != {context.num_samples} or len(rates) != 1:
+                continue
+            effective_rate = float(rates[0])
+            matching = [
+                spec for spec in DROPOUT_SOURCE_SPECS if abs(float(spec["dropout_rate"]) - effective_rate) <= 1e-12
+            ]
+            if len(matching) != 1:
+                continue
+            spec = matching[0]
+            run_id = str(spec["run_id"])
+            if run_id in found:
+                continue
+            validate_dropout_summary(
+                path,
+                run_id=run_id,
+                expected_rate=float(spec["dropout_rate"]),
+                metadata=metadata,
+            )
+            found[run_id] = path
+            print("validated existing dropout source:", run_id, path)
+        except Exception as exc:
+            print("ignoring incompatible dropout summary:", path, type(exc).__name__, exc)
+    return found
+
+
+def _stage_dropout_sources(context: DropoutSourceContext, sources: Mapping[str, Path]) -> None:
+    import pandas as pd
+
+    try:
+        from build_score_pool_extra_training_sets import validate_dropout_summary
+    except ModuleNotFoundError:
+        from scripts.build_score_pool_extra_training_sets import validate_dropout_summary
+
+    metadata_path = context.drive_root / "data" / "score_pool_meta_official_500k.parquet"
+    metadata = pd.read_parquet(metadata_path)
+    specs = {str(spec["run_id"]): spec for spec in DROPOUT_SOURCE_SPECS}
+    for run_id, destination in context.staging_paths.items():
+        source = Path(sources[run_id])
+        destination = Path(destination)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if source.resolve() != destination.resolve():
+            temporary = destination.with_suffix(destination.suffix + ".tmp")
+            shutil.copy2(source, temporary)
+            validate_dropout_summary(
+                temporary,
+                run_id=run_id,
+                expected_rate=float(specs[run_id]["dropout_rate"]),
+                metadata=metadata,
+            )
+            temporary.replace(destination)
+        validate_dropout_summary(
+            destination,
+            run_id=run_id,
+            expected_rate=float(specs[run_id]["dropout_rate"]),
+            metadata=metadata,
+        )
+        print("staged dropout source:", run_id, destination)
+
+
+def ensure_dropout_lcb_sources(context: DropoutSourceContext) -> dict[str, Path]:
+    import numpy as np
+    import sys
+
+    validate_dropout_source_context(context)
+    os.environ.setdefault("WANDB_MODE", "disabled")
+    os.environ["PYTHONUNBUFFERED"] = "1"
+
+    code_root = str(context.olmo_dir)
+    if code_root not in sys.path:
+        sys.path.insert(0, code_root)
+
+    from scripts.targeted_dropout_colab_helpers import (
+        ScoringContext,
+        SubsetContext,
+        TargetedDropoutRunner,
+        TargetedDropoutWorkflow,
+        WorkflowContext,
+        build_shard_plan,
+        prepare_fixed_subset,
+    )
+
+    found = discover_valid_dropout_sources(context)
+    missing_run_ids = [str(spec["run_id"]) for spec in DROPOUT_SOURCE_SPECS if str(spec["run_id"]) not in found]
+    if not missing_run_ids:
+        _stage_dropout_sources(context, found)
+        return {run_id: Path(path) for run_id, path in context.staging_paths.items()}
+
+    target_configs = dropout_source_configs(missing_run_ids)
+    print("missing full-pool dropout sources:", missing_run_ids)
+    print("scoring configs:", [config["config_id"] for config in target_configs])
+
+    stage_name = "score-pool-embedding-dropout-sources-500k"
+    run_stage = "stage_c_500k"
+    stage_root = context.drive_root / "results" / stage_name
+    raw_score_drive = stage_root / "raw_score_shards"
+    config_drive = context.drive_root / "runtime_configs" / stage_name
+    subset_manifest = stage_root / "subset_manifest.json"
+    source_rows = stage_root / "subset_source_rows.npy"
+    run_state_path = stage_root / "run_state.json"
+    report_drive = stage_root / "report"
+    local_work = Path("/content") / stage_name
+    runtime_config_dir = local_work / "runtime_configs"
+    runtime_checkpoint_dir = local_work / "runtime_checkpoints"
+    for path in (
+        stage_root,
+        raw_score_drive,
+        config_drive,
+        report_drive,
+        local_work,
+        runtime_config_dir,
+        runtime_checkpoint_dir,
+    ):
+        path.mkdir(parents=True, exist_ok=True)
+
+    data_root = context.drive_root / "data"
+    models_root = context.drive_root / "assets" / "raw" / "models"
+    results_root = context.drive_root / "results"
+    prepared = prepare_fixed_subset(
+        SubsetContext(
+            run_stage=run_stage,
+            subset_id=stage_name,
+            stage_rows=500_000,
+            seq_len=512,
+            selection_seed=1729,
+            expected_source_rows=500_000,
+            rows_per_stage_b_pool=20_000,
+            tokens_path=data_root / "score_pool_tokens_official_500k.npy",
+            metadata_path=data_root / "score_pool_meta_official_500k.parquet",
+            full_scores_path=results_root / "score-pool-robustness-official-500k" / "scores_full.parquet",
+            prior_checkpoint=models_root / "prior",
+            books_checkpoint=models_root / "conditional_books",
+            local_work=local_work,
+            source_rows_path=source_rows,
+            subset_manifest_path=subset_manifest,
+            producer_sha=context.producer_sha,
+            analysis_sha=context.producer_sha,
+            notebook_revision=context.notebook_revision,
+            runtime_identity=context.runtime_identity,
+        )
+    )
+    shards = build_shard_plan(
+        500_000, context.shard_rows, context.global_batch_size, stage_root / "shard_plan.json"
+    )
+    checkpoint_identities = prepared.checkpoint_identities
+    runner = TargetedDropoutRunner(
+        ScoringContext(
+            olmo_dir=context.olmo_dir,
+            template_config=context.olmo_dir / "configs/sweeps/score-targeted-dropout-uncertainty.yaml",
+            runtime_checkpoint_dir=runtime_checkpoint_dir,
+            runtime_config_dir=runtime_config_dir,
+            config_drive=config_drive,
+            raw_score_drive=raw_score_drive,
+            stage_root=stage_root,
+            subset_raw=prepared.raw_tokens_path,
+            run_state_path=run_state_path,
+            producer_sha=context.producer_sha,
+            analysis_sha=context.producer_sha,
+            notebook_revision=context.notebook_revision,
+            run_stage=run_stage,
+            subset_id=stage_name,
+            subset_fingerprint=prepared.subset_fingerprint,
+            runtime_identity=context.runtime_identity,
+            checkpoint_identities=checkpoint_identities,
+            seed=context.seed,
+            num_samples=context.num_samples,
+            global_batch_size=context.global_batch_size,
+            stage_rows=500_000,
+            shard_rows=context.shard_rows,
+            file_seqs=context.file_seqs,
+        )
+    )
+
+    def workflow(microbatch: int) -> TargetedDropoutWorkflow:
+        return TargetedDropoutWorkflow(
+            WorkflowContext(
+                runner=runner,
+                olmo_dir=context.olmo_dir,
+                stage_root=stage_root,
+                config_drive=config_drive,
+                report_drive=report_drive,
+                subset_metadata=prepared.metadata_path,
+                subset_full_scores=prepared.full_scores_path,
+                subset_manifest=subset_manifest,
+                source_rows_path=source_rows,
+                target_configs=target_configs,
+                shards=shards,
+                producer_sha=context.producer_sha,
+                analysis_sha=context.producer_sha,
+                notebook_revision=context.notebook_revision,
+                run_stage=run_stage,
+                stage_rows=500_000,
+                num_samples=context.num_samples,
+                seed=context.seed,
+                tau64_cutoff=context.tau64_cutoff,
+                global_batch_size=context.global_batch_size,
+                shard_rows=context.shard_rows,
+                microbatch=microbatch,
+            )
+        )
+
+    control = {
+        "config_id": "dropout_trainmode_p000_score_pool_smoke",
+        "dropout_target": "none",
+        "attention_dropout": 0.0,
+        "residual_dropout": 0.0,
+        "embedding_dropout": 0.0,
+        "purpose": "runtime and full-pool row-alignment gate",
+    }
+    prior_checkpoint = models_root / "prior"
+    books_checkpoint = models_root / "conditional_books"
+    smoke = workflow(context.initial_microbatch).run_zero_dropout_smoke(
+        control,
+        prior_checkpoint,
+        books_checkpoint,
+        context.smoke_rows,
+    )
+    print("dropout-source smoke gate passed:", smoke)
+
+    try:
+        state = json.loads(run_state_path.read_text())
+        if state.get("runtime_identity") != dict(context.runtime_identity):
+            raise RuntimeError("persisted benchmark runtime identity does not match this Colab runtime")
+        if state.get("global_batch_size") != context.global_batch_size:
+            raise RuntimeError("persisted benchmark global batch size does not match this scoring run")
+        microbatch = runner.load_persisted_microbatch()
+        print("using persisted dropout-source microbatch:", microbatch)
+    except (FileNotFoundError, RuntimeError, ValueError) as exc:
+        print("running bounded dropout-source microbatch benchmark:", type(exc).__name__, exc)
+        benchmark_shard = {
+            "start": 0,
+            "end": context.benchmark_rows,
+            "rows": context.benchmark_rows,
+            "data_start_step": 0,
+        }
+        results, selected = runner.benchmark_microbatches(
+            config=control,
+            model_id="prior",
+            checkpoint_path=prior_checkpoint,
+            benchmark_root=stage_root / "_smoke_and_benchmark" / "benchmark",
+            shard=benchmark_shard,
+            candidates=sorted({context.initial_microbatch, context.global_batch_size}),
+            seq_len=512,
+        )
+        microbatch = int(selected["microbatch"])
+        state = {
+            "schema_version": 2,
+            "created_utc": datetime.now(timezone.utc).isoformat(),
+            "stage": run_stage,
+            "producer_sha": context.producer_sha,
+            "subset_fingerprint": prepared.subset_fingerprint,
+            "analysis_sha": context.producer_sha,
+            "notebook_revision": context.notebook_revision,
+            "num_samples": context.num_samples,
+            "microbatch": microbatch,
+            "global_batch_size": context.global_batch_size,
+            "shard_rows": context.shard_rows,
+            "runtime_identity": dict(context.runtime_identity),
+            "benchmark": selected,
+            "benchmark_results": results,
+        }
+        run_state_path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
+        print("selected dropout-source microbatch:", microbatch)
+
+    active_workflow = workflow(microbatch)
+    status = active_workflow.status()
+    remaining = [row for row in status if not row["valid"]]
+    benchmark = state.get("benchmark", {})
+    throughput = benchmark.get("tokens_per_second")
+    if throughput:
+        remaining_tokens = sum(int(row["rows"]) for row in remaining) * 512
+        eta_hours = remaining_tokens / float(throughput) / 3600
+        print(
+            f"dropout-source scoring: {len(remaining)}/{len(status)} shards remain; compute ETA={eta_hours:.2f}h"
+        )
+    else:
+        print(f"dropout-source scoring: {len(remaining)}/{len(status)} shards remain")
+
+    for config in target_configs:
+        for model_id, checkpoint in (("prior", prior_checkpoint), ("books", books_checkpoint)):
+            for shard in shards:
+                runner.run_score_once(
+                    config,
+                    model_id,
+                    checkpoint,
+                    runner.shard_output_dir(str(config["config_id"]), model_id, shard),
+                    shard,
+                    microbatch,
+                )
+    active_workflow.analyze()
+
+    found = discover_valid_dropout_sources(context)
+    still_missing = [str(spec["run_id"]) for spec in DROPOUT_SOURCE_SPECS if str(spec["run_id"]) not in found]
+    if still_missing:
+        raise RuntimeError(f"Dropout scoring completed but valid sources are still missing: {still_missing}")
+    _stage_dropout_sources(context, found)
+    return {run_id: Path(path) for run_id, path in context.staging_paths.items()}
 
 
 def generate_runtime_configs(
