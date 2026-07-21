@@ -28,10 +28,16 @@ def test_report_state_is_defined_before_training_section() -> None:
     assert "len(production_order) == len(set(production_order))" in code[setup_index]
     assert "EXPECTED_EVAL_POINTS = 10" in code[setup_index]
 
-    base_run_ids = [f"base_{index}_100k" for index in range(8)] + [
+    hard_source_base_run_ids = [
         "hard_positive_oracle_100k",
         "hard_pair_cascade_100k",
+        "hard_union_control_100k",
+        "hard_pair_mid2_only_100k",
+        "hard_dropout_embed_p000001_conservative_100k",
+        "hard_dropout_embed_p0005_conservative_100k",
+        "hard_dropout_embed_p001_conservative_100k",
     ]
+    base_run_ids = [f"random_{index}_100k" for index in range(3)] + hard_source_base_run_ids
     runtime_config_map = {run_id: Path(f"/{run_id}.yaml") for run_id in base_run_ids}
 
     class FakeHelper:
@@ -54,4 +60,6 @@ def test_report_state_is_defined_before_training_section() -> None:
     exec(code[setup_index], namespace)
 
     assert namespace["base_production_order"] == base_run_ids
-    assert len(namespace["production_order"]) == len(set(namespace["production_order"])) == 14
+    assert namespace["HARD_SOURCE_SEED_BASE_RUNS"] == hard_source_base_run_ids
+    assert len(namespace["hard_source_seed_run_ids"]) == 14
+    assert len(namespace["production_order"]) == len(set(namespace["production_order"])) == 24

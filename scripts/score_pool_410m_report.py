@@ -63,6 +63,9 @@ RUN_GROUPS = {
     },
 }
 
+BASE_TRAINING_SEED = 17
+HARD_SOURCE_SEED_COUNT = 3
+HARD_SOURCE_SEED_T_CRITICAL_95 = 4.302652729911275
 HARD_SEED_PAIR_BASE_RUN_IDS = (
     "hard_positive_oracle_100k",
     "hard_pair_cascade_100k",
@@ -76,6 +79,7 @@ FIGURES = (
     "eval_loss_books_random_source.png",
     "eval_loss_books_hard_source.png",
     "eval_loss_books_hard_oracle_vs_cascade_seeds.png",
+    "eval_loss_books_hard_source_seed_ci.png",
     "eval_loss_c4_by_run.png",
     "eval_loss_c4_random_source.png",
     "eval_loss_c4_hard_source.png",
@@ -130,6 +134,60 @@ def dynamic_run_groups(run_ids: Iterable[str]) -> dict[str, dict[str, object]]:
             "run_ids": tuple(run_id for run_id in run_ids if base_run_id(run_id) in base_ids),
         }
     return groups
+
+
+def aggregate_hard_source_seed_eval(
+    eval_metrics: pd.DataFrame,
+    run_ids: Iterable[str],
+) -> pd.DataFrame:
+    columns = [
+        "base_run_id",
+        "label",
+        "step",
+        "mean",
+        "sample_std",
+        "seed_count",
+        "ci95_half_width",
+        "ci95_lower",
+        "ci95_upper",
+    ]
+    if eval_metrics.empty:
+        return pd.DataFrame(columns=columns)
+
+    hard_base_ids = set(RUN_GROUPS["hard_source"]["run_ids"])
+    selected_run_ids = set(run_ids)
+    selected = eval_metrics[
+        (eval_metrics["metric"] == "CrossEntropyLoss")
+        & eval_metrics["run_id"].isin(selected_run_ids)
+        & eval_metrics["run_id"].map(base_run_id).isin(hard_base_ids)
+    ].copy()
+    if selected.empty:
+        return pd.DataFrame(columns=columns)
+
+    selected["base_run_id"] = selected["run_id"].map(base_run_id)
+    selected["seed"] = selected["run_id"].map(run_seed).fillna(BASE_TRAINING_SEED).astype(int)
+    per_seed = (
+        selected.groupby(["base_run_id", "label", "step", "seed"], as_index=False)["value"]
+        .mean()
+    )
+    aggregate = (
+        per_seed.groupby(["base_run_id", "label", "step"], as_index=False)
+        .agg(
+            mean=("value", "mean"),
+            sample_std=("value", "std"),
+            seed_count=("seed", "nunique"),
+        )
+    )
+    aggregate["ci95_half_width"] = np.where(
+        aggregate["seed_count"] == HARD_SOURCE_SEED_COUNT,
+        HARD_SOURCE_SEED_T_CRITICAL_95
+        * aggregate["sample_std"]
+        / np.sqrt(aggregate["seed_count"]),
+        np.nan,
+    )
+    aggregate["ci95_lower"] = aggregate["mean"] - aggregate["ci95_half_width"]
+    aggregate["ci95_upper"] = aggregate["mean"] + aggregate["ci95_half_width"]
+    return aggregate[columns]
 
 
 def hard_seed_pair_run_ids(run_ids: Iterable[str]) -> tuple[str, ...]:
@@ -399,6 +457,7 @@ def generate_figures(
     run_ids: list[str],
     train_metrics: pd.DataFrame,
     eval_metrics: pd.DataFrame,
+    hard_source_seed_eval: pd.DataFrame,
     overlap: pd.DataFrame,
     allow_log_only_runs: bool,
 ) -> None:
@@ -467,6 +526,44 @@ def generate_figures(
                 ylabel=ylabel,
             )
 
+    def plot_hard_source_seed_ci(frame: pd.DataFrame) -> None:
+        plt.figure(figsize=(9, 6))
+        plotted = False
+        for run_id in RUN_GROUPS["hard_source"]["run_ids"]:
+            group = frame[
+                (frame["base_run_id"] == run_id)
+                & (frame["seed_count"] == HARD_SOURCE_SEED_COUNT)
+            ].sort_values("step")
+            if group.empty:
+                continue
+            (line,) = plt.plot(
+                group["step"],
+                group["mean"],
+                marker="o",
+                linewidth=1.8,
+                label=run_label(run_id),
+            )
+            complete_ci = group["ci95_half_width"].notna()
+            if complete_ci.any():
+                ci_group = group[complete_ci]
+                plt.fill_between(
+                    ci_group["step"],
+                    ci_group["ci95_lower"],
+                    ci_group["ci95_upper"],
+                    color=line.get_color(),
+                    alpha=0.12,
+                )
+            plotted = True
+        plt.xlabel("Optimizer step")
+        plt.ylabel("Eval cross entropy")
+        plt.title("Hard Source Books Validation Loss: Mean and 95% t CI (n=3)")
+        if plotted:
+            plt.legend(fontsize=8)
+        else:
+            plt.text(0.5, 0.5, "No complete hard-source seed metrics", ha="center", va="center")
+        plt.grid(alpha=0.3)
+        savefig(figures_dir / "eval_loss_books_hard_source_seed_ci.png")
+
     if not train_metrics.empty:
         plot_learning_family(
             train_metrics,
@@ -518,6 +615,9 @@ def generate_figures(
                 filename="eval_loss_books_hard_oracle_vs_cascade_seeds.png",
                 title="Hard Source Books Validation Loss: Oracle vs Cascade Seeds",
                 ylabel="Eval cross entropy",
+            )
+            plot_hard_source_seed_ci(
+                hard_source_seed_eval[hard_source_seed_eval["label"] == "books_val"]
             )
 
     meta_all = load_meta_frames(train_data_dir, run_ids, allow_missing=allow_log_only_runs)
@@ -646,6 +746,7 @@ def write_report(
     overlap: pd.DataFrame,
     train_metrics: pd.DataFrame,
     eval_metrics: pd.DataFrame,
+    hard_source_seed_eval: pd.DataFrame,
     allow_log_only_runs: bool,
 ) -> None:
     final_train = (
@@ -666,6 +767,21 @@ def write_report(
             .reset_index()
         )
         eval_summary = add_variant_label(sort_by_run_order(eval_summary, run_ids))
+
+    hard_seed_final = pd.DataFrame()
+    if not hard_source_seed_eval.empty:
+        hard_seed_final = (
+            hard_source_seed_eval[
+                (hard_source_seed_eval["label"] == "books_val")
+                & (hard_source_seed_eval["seed_count"] == HARD_SOURCE_SEED_COUNT)
+            ]
+            .sort_values(["base_run_id", "step"])
+            .groupby("base_run_id")
+            .tail(1)
+            .rename(columns={"base_run_id": "run_id"})
+            .reset_index(drop=True)
+        )
+        hard_seed_final = add_variant_label(sort_by_run_order(hard_seed_final, run_ids))
 
     manifest = json.loads(eval_manifest_path.read_text())
     run_count_word = {4: "four", 5: "five", 6: "six"}.get(len(run_ids), str(len(run_ids)))
@@ -877,6 +993,24 @@ def write_report(
         if not eval_summary.empty
         else "_No eval metrics parsed._"
     )
+    report.extend(["", "## Hard-Source Seed Aggregate", ""])
+    report.append(
+        md_table(
+            hard_seed_final,
+            [
+                "run_id",
+                "variant",
+                "step",
+                "mean",
+                "sample_std",
+                "seed_count",
+                "ci95_lower",
+                "ci95_upper",
+            ],
+        )
+        if not hard_seed_final.empty
+        else "_No complete hard-source seed aggregate parsed._"
+    )
     report.extend(
         [
             "",
@@ -897,6 +1031,10 @@ def write_report(
         (
             "eval_loss_books_hard_oracle_vs_cascade_seeds.png",
             "Hard-source Books validation cross entropy for oracle and cascade seed repeats.",
+        ),
+        (
+            "eval_loss_books_hard_source_seed_ci.png",
+            "Hard-source Books validation cross entropy means and 95% Student-t intervals across seeds 17-19.",
         ),
         ("eval_loss_c4_random_source.png", "Random-source C4 validation proxy cross entropy over optimizer steps."),
         ("eval_loss_c4_hard_source.png", "Hard-source C4 validation proxy cross entropy over optimizer steps."),
@@ -925,7 +1063,8 @@ def write_report(
             "## Limitations",
             "",
             (
-                "- Seed-repeat coverage is limited to the hard positive-only baseline and hard PN cascade."
+                "- Hard-source confidence intervals use only three training seeds (17-19); "
+                "the resulting 95% Student-t intervals are sensitive to individual runs."
                 if has_seed_repeats
                 else "- This is a single-seed pilot."
             ),
@@ -963,6 +1102,8 @@ def write_metrics_and_report(args: argparse.Namespace) -> None:
     train_metrics.to_csv(args.results_dir / "train_metrics_from_logs.csv", index=False)
     eval_metrics.to_csv(args.results_dir / "eval_metrics_from_logs.csv", index=False)
     checkpoint_saves.to_csv(args.results_dir / "checkpoint_save_times.csv", index=False)
+    hard_source_seed_eval = aggregate_hard_source_seed_eval(eval_metrics, run_ids)
+    hard_source_seed_eval.to_csv(args.results_dir / "hard_source_seed_eval_summary.csv", index=False)
 
     for run_id, frame in train_metrics.groupby("run_id") if not train_metrics.empty else []:
         frame.to_json(args.results_dir / f"{run_id}_train_metrics.jsonl", orient="records", lines=True)
@@ -1022,6 +1163,7 @@ def write_metrics_and_report(args: argparse.Namespace) -> None:
         run_ids=run_ids,
         train_metrics=train_metrics,
         eval_metrics=eval_metrics,
+        hard_source_seed_eval=hard_source_seed_eval,
         overlap=overlap,
         allow_log_only_runs=args.allow_log_only_runs,
     )
@@ -1043,6 +1185,7 @@ def write_metrics_and_report(args: argparse.Namespace) -> None:
         overlap=overlap,
         train_metrics=train_metrics,
         eval_metrics=eval_metrics,
+        hard_source_seed_eval=hard_source_seed_eval,
         allow_log_only_runs=args.allow_log_only_runs,
     )
     acceptance_check(args)
@@ -1054,6 +1197,7 @@ def acceptance_check(args: argparse.Namespace) -> None:
         args.results_dir / "train_metrics_from_logs.csv",
         args.results_dir / "eval_metrics_from_logs.csv",
         args.results_dir / "checkpoint_save_times.csv",
+        args.results_dir / "hard_source_seed_eval_summary.csv",
         args.results_dir / "throughput_comparison.csv",
         args.results_dir / "selection_diagnostics.csv",
         args.results_dir / "overlap_jaccard.csv",
@@ -1112,6 +1256,22 @@ def acceptance_check(args: argparse.Namespace) -> None:
     )
     if not (eval_counts >= expected_eval_points).all():
         raise AssertionError(eval_counts)
+
+    if any(run_seed(run_id) is not None for run_id in args.run_id):
+        hard_seed_summary = pd.read_csv(args.results_dir / "hard_source_seed_eval_summary.csv")
+        expected_hard_base_ids = {
+            run_id
+            for run_id in RUN_GROUPS["hard_source"]["run_ids"]
+            if run_id in args.run_id
+        }
+        if set(hard_seed_summary["base_run_id"]) != expected_hard_base_ids:
+            raise AssertionError(hard_seed_summary[["base_run_id"]])
+        if not (hard_seed_summary["seed_count"] == HARD_SOURCE_SEED_COUNT).all():
+            raise AssertionError(
+                hard_seed_summary[["base_run_id", "label", "step", "seed_count"]]
+            )
+        if hard_seed_summary[["ci95_lower", "ci95_upper"]].isna().any().any():
+            raise AssertionError("Missing hard-source 95% confidence interval")
     print(
         eval_metrics[eval_metrics["metric"] == "CrossEntropyLoss"]
         .sort_values(["run_id", "label", "step"])
