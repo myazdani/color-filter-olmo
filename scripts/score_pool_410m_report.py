@@ -22,6 +22,7 @@ DEFAULT_RUN_IDS = (
     "hard_pair_cascade_100k",
     "hard_union_control_100k",
     "hard_pair_mid2_only_100k",
+    "hard_pair_mid4_only_100k",
     "hard_dropout_embed_p000001_conservative_100k",
     "hard_dropout_embed_p0005_conservative_100k",
     "hard_dropout_embed_p001_conservative_100k",
@@ -35,6 +36,7 @@ RUN_LABELS = {
     "hard_pair_cascade_100k": "Hard PN cascade",
     "hard_union_control_100k": "Hard PN mixture control",
     "hard_pair_mid2_only_100k": "Hard PN pair-mid2-only",
+    "hard_pair_mid4_only_100k": "Hard PN pair-mid4-only",
     "hard_dropout_embed_p000001_conservative_100k": "Hard PN embedding-dropout LCB p=1e-5",
     "hard_dropout_embed_p0005_conservative_100k": "Hard PN embedding-dropout LCB p=0.005",
     "hard_dropout_embed_p001_conservative_100k": "Hard PN embedding-dropout LCB p=0.01",
@@ -56,6 +58,7 @@ RUN_GROUPS = {
             "hard_pair_cascade_100k",
             "hard_union_control_100k",
             "hard_pair_mid2_only_100k",
+            "hard_pair_mid4_only_100k",
             "hard_dropout_embed_p000001_conservative_100k",
             "hard_dropout_embed_p0005_conservative_100k",
             "hard_dropout_embed_p001_conservative_100k",
@@ -88,6 +91,7 @@ FIGURES = (
     "tokens_per_second_hard_source.png",
     "selection_full_score_distributions.png",
     "selection_pair_mid2_score_distributions.png",
+    "selection_pair_mid4_score_distributions.png",
     "selected_set_overlap_heatmap.png",
     "selected_set_overlap_random_source.png",
     "selected_set_overlap_hard_source.png",
@@ -622,8 +626,21 @@ def generate_figures(
 
     meta_all = load_meta_frames(train_data_dir, run_ids, allow_missing=allow_log_only_runs)
     for column, filename, title in [
-        ("local_full_color_score", "selection_full_score_distributions.png", "Selected Full CoLoR Score Distributions"),
-        ("pair_mid2_color_score", "selection_pair_mid2_score_distributions.png", "Selected Pair-Mid2 Score Distributions"),
+        (
+            "local_full_color_score",
+            "selection_full_score_distributions.png",
+            "Selected Full CoLoR Score Distributions",
+        ),
+        (
+            "pair_mid2_color_score",
+            "selection_pair_mid2_score_distributions.png",
+            "Selected Pair-Mid2 Score Distributions",
+        ),
+        (
+            "pair_mid4_color_score",
+            "selection_pair_mid4_score_distributions.png",
+            "Selected Pair-Mid4 Score Distributions",
+        ),
     ]:
         if column not in meta_all.columns:
             fallback = "full_color_score" if column == "local_full_color_score" else column
@@ -860,6 +877,11 @@ def write_report(
             "`pair_mid2` scores directly from `hard_positive union hard_negative`, with no full rerank."
         ),
         (
+            "- `hard_pair_mid4_only_100k` (Hard PN pair-mid4-only): remove zero-based blocks "
+            "`4-7` from both 12-layer scoring models, then choose the lowest 100K `pair_mid4` "
+            "scores directly from `hard_positive union hard_negative`, with no full rerank."
+        ),
+        (
             "- `hard_dropout_embed_p000001_conservative_100k`, "
             "`hard_dropout_embed_p0005_conservative_100k`, and "
             "`hard_dropout_embed_p001_conservative_100k` (Hard PN embedding-dropout LCB): "
@@ -1044,6 +1066,7 @@ def write_report(
         ("selected_set_overlap_hard_source.png", "Hard-source selected-set overlap matrix, reported as Jaccard overlap over `seq_idx`."),
         ("selection_full_score_distributions.png", "Distribution of selected full CoLoR scores."),
         ("selection_pair_mid2_score_distributions.png", "Distribution of selected pair-mid2 CoLoR scores."),
+        ("selection_pair_mid4_score_distributions.png", "Distribution of selected pair-mid4 CoLoR scores."),
     ]:
         report.extend([f"![{caption}](figures/{filename})", ""])
     report.extend(

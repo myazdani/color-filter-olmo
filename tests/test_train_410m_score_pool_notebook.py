@@ -33,6 +33,7 @@ def test_report_state_is_defined_before_training_section() -> None:
         "hard_pair_cascade_100k",
         "hard_union_control_100k",
         "hard_pair_mid2_only_100k",
+        "hard_pair_mid4_only_100k",
         "hard_dropout_embed_p000001_conservative_100k",
         "hard_dropout_embed_p0005_conservative_100k",
         "hard_dropout_embed_p001_conservative_100k",
@@ -61,5 +62,14 @@ def test_report_state_is_defined_before_training_section() -> None:
 
     assert namespace["base_production_order"] == base_run_ids
     assert namespace["HARD_SOURCE_SEED_BASE_RUNS"] == hard_source_base_run_ids
-    assert len(namespace["hard_source_seed_run_ids"]) == 14
-    assert len(namespace["production_order"]) == len(set(namespace["production_order"])) == 24
+    assert len(namespace["hard_source_seed_run_ids"]) == 16
+    assert len(namespace["production_order"]) == len(set(namespace["production_order"])) == 27
+
+
+def test_pair_mid4_source_and_training_run_are_wired() -> None:
+    notebook = json.loads(NOTEBOOK.read_text())
+    source = "\n".join(cell["source"] for cell in notebook["cells"])
+
+    assert "scores_pair_mid4.parquet" in source
+    assert '"hard_pair_mid4_only_100k": template' in source
+    assert "zero-based blocks `4-7`" in source

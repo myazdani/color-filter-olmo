@@ -12,7 +12,9 @@ if str(SCRIPTS) not in sys.path:
 
 from score_pool_410m_report import (  # noqa: E402
     DEFAULT_C4_PROXY_NOTE,
+    DEFAULT_RUN_IDS,
     HARD_SOURCE_SEED_T_CRITICAL_95,
+    RUN_GROUPS,
     aggregate_hard_source_seed_eval,
     c4_proxy_note,
 )
@@ -34,6 +36,13 @@ def test_c4_proxy_note_preserves_manifest_note() -> None:
     manifest = {"c4_val_proxy": {"note": "Exact source note."}}
 
     assert c4_proxy_note(manifest) == "Exact source note."
+
+
+def test_pair_mid4_is_registered_as_a_hard_source_run() -> None:
+    run_id = "hard_pair_mid4_only_100k"
+
+    assert run_id in DEFAULT_RUN_IDS
+    assert run_id in RUN_GROUPS["hard_source"]["run_ids"]
 
 
 def test_hard_source_seed_eval_includes_base_seed_in_student_t_interval() -> None:

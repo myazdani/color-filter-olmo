@@ -15,7 +15,18 @@ import pandas as pd
 
 
 HARD_POOLS = ("hard_positive", "hard_negative")
-PAIR_ONLY_RUN_ID = "hard_pair_mid2_only_100k"
+PAIR_SCORE_SPECS = {
+    "hard_pair_mid2_only_100k": {
+        "variant_id": "pair_mid2",
+        "removed_layers": (5, 6),
+        "score_column": "pair_mid2_color_score",
+    },
+    "hard_pair_mid4_only_100k": {
+        "variant_id": "pair_mid4",
+        "removed_layers": (4, 5, 6, 7),
+        "score_column": "pair_mid4_color_score",
+    },
+}
 LCB_SPECS = {
     "hard_dropout_embed_p000001_conservative_100k": 1e-5,
     "hard_dropout_embed_p0005_conservative_100k": 0.005,
@@ -44,6 +55,75 @@ def select_lowest(frame: pd.DataFrame, column: str, rows: int) -> pd.DataFrame:
     if len(frame) < rows:
         raise ValueError(f"Need {rows:,} rows, found {len(frame):,}")
     return frame.sort_values([column, "seq_idx"], kind="mergesort").head(rows).copy()
+
+
+def _parse_removed_layers(value: object) -> tuple[int, ...]:
+    parsed = json.loads(value) if isinstance(value, str) else value
+    if not isinstance(parsed, (list, tuple, np.ndarray)):
+        raise ValueError(f"Expected a layer-index sequence, found {value!r}")
+    return tuple(int(layer) for layer in parsed)
+
+
+def validate_pair_score_frame(
+    scores: pd.DataFrame,
+    *,
+    run_id: str,
+    expected_variant_id: str,
+    expected_removed_layers: tuple[int, ...],
+    metadata: pd.DataFrame,
+) -> pd.DataFrame:
+    required = {
+        "seq_idx",
+        "pool_name",
+        "ablated_color_score",
+        "variant_id",
+        "variant_family",
+        "cond_removed_layers",
+        "marg_removed_layers",
+        "cond_kept_layers",
+        "marg_kept_layers",
+    }
+    if missing := sorted(required - set(scores.columns)):
+        raise ValueError(f"{run_id}: pair scores missing required columns: {missing}")
+    if len(scores) != len(metadata) or scores["seq_idx"].nunique() != len(scores):
+        raise ValueError(f"{run_id}: expected one unique pair score for every metadata row")
+    if set(scores["seq_idx"].astype(np.int64)) != set(metadata["seq_idx"].astype(np.int64)):
+        raise ValueError(f"{run_id}: pair-score seq_idx values do not match the official score pool")
+    if set(scores["variant_id"].astype(str)) != {expected_variant_id}:
+        raise ValueError(f"{run_id}: expected variant_id={expected_variant_id}")
+    if set(scores["variant_family"].astype(str)) != {"paired"}:
+        raise ValueError(f"{run_id}: expected paired conditional/marginal ablation")
+
+    expected_removed = tuple(expected_removed_layers)
+    for column in ("cond_removed_layers", "marg_removed_layers"):
+        actual = {_parse_removed_layers(value) for value in scores[column].dropna().unique()}
+        if actual != {expected_removed}:
+            raise ValueError(f"{run_id}: expected {column}={expected_removed}, found {sorted(actual)}")
+    expected_kept = 12 - len(expected_removed)
+    for column in ("cond_kept_layers", "marg_kept_layers"):
+        actual = set(scores[column].dropna().astype(int))
+        if actual != {expected_kept}:
+            raise ValueError(f"{run_id}: expected {column}={expected_kept}, found {sorted(actual)}")
+    return scores
+
+
+def validate_pair_scores(
+    path: Path,
+    *,
+    run_id: str,
+    expected_variant_id: str,
+    expected_removed_layers: tuple[int, ...],
+    metadata: pd.DataFrame,
+) -> pd.DataFrame:
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    return validate_pair_score_frame(
+        pd.read_parquet(path),
+        run_id=run_id,
+        expected_variant_id=expected_variant_id,
+        expected_removed_layers=expected_removed_layers,
+        metadata=metadata,
+    )
 
 
 def write_tokens(tokens: np.ndarray, seq_idx: np.ndarray, path: Path, sequence_length: int) -> None:
@@ -191,6 +271,7 @@ def main() -> None:
     parser.add_argument("--tokens", type=Path, required=True)
     parser.add_argument("--metadata", type=Path, required=True)
     parser.add_argument("--pair-mid2-scores", type=Path, required=True)
+    parser.add_argument("--pair-mid4-scores", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--dropout-selection", action="append", type=parse_dropout_selection, default=[])
     parser.add_argument("--target-rows", type=int, default=100_000)
@@ -213,27 +294,55 @@ def main() -> None:
     if len(hard_metadata) != 200_000:
         raise ValueError(f"Expected 200K hard-union rows, found {len(hard_metadata):,}")
 
-    pair_scores = pd.read_parquet(args.pair_mid2_scores, columns=["seq_idx", "pool_name", "ablated_color_score"])
-    pair_scores = pair_scores.rename(columns={"ablated_color_score": "pair_mid2_color_score"})
-    hard_pair = hard_metadata.merge(pair_scores, on=["seq_idx", "pool_name"], how="inner", validate="one_to_one")
-    if len(hard_pair) != len(hard_metadata):
-        raise ValueError("pair_mid2 scores do not cover the hard-union pool")
-
     diagnostics = []
-    pair_scores_sha256 = sha256_file(args.pair_mid2_scores)
-    pair_selected = select_lowest(hard_pair, "pair_mid2_color_score", args.target_rows)
-    diagnostics.append(
-        write_dataset(
-            output_dir=args.output_dir,
-            run_id=PAIR_ONLY_RUN_ID,
-            selected=pair_selected,
-            tokens=tokens,
-            selection_policy="pair_mid2_direct_topk",
-            score_column="pair_mid2_color_score",
-            source_artifact=args.pair_mid2_scores,
-            source_artifact_sha256=pair_scores_sha256,
+    pair_paths = {
+        "hard_pair_mid2_only_100k": args.pair_mid2_scores,
+        "hard_pair_mid4_only_100k": args.pair_mid4_scores,
+    }
+    for run_id, spec in PAIR_SCORE_SPECS.items():
+        pair_path = pair_paths[run_id]
+        pair_scores = validate_pair_scores(
+            pair_path,
+            run_id=run_id,
+            expected_variant_id=str(spec["variant_id"]),
+            expected_removed_layers=tuple(spec["removed_layers"]),
+            metadata=metadata,
         )
-    )
+        score_column = str(spec["score_column"])
+        pair_scores = pair_scores.rename(columns={"ablated_color_score": score_column})
+        hard_pair = hard_metadata.merge(
+            pair_scores[
+                [
+                    "seq_idx",
+                    "pool_name",
+                    score_column,
+                    "variant_id",
+                    "variant_family",
+                    "cond_removed_layers",
+                    "marg_removed_layers",
+                    "cond_kept_layers",
+                    "marg_kept_layers",
+                ]
+            ],
+            on=["seq_idx", "pool_name"],
+            how="inner",
+            validate="one_to_one",
+        )
+        if len(hard_pair) != len(hard_metadata):
+            raise ValueError(f"{spec['variant_id']} scores do not cover the hard-union pool")
+        pair_selected = select_lowest(hard_pair, score_column, args.target_rows)
+        diagnostics.append(
+            write_dataset(
+                output_dir=args.output_dir,
+                run_id=run_id,
+                selected=pair_selected,
+                tokens=tokens,
+                selection_policy=f"{spec['variant_id']}_direct_topk",
+                score_column=score_column,
+                source_artifact=pair_path,
+                source_artifact_sha256=sha256_file(pair_path),
+            )
+        )
 
     metadata_by_seq = metadata[["seq_idx", "pool_name", "c4_index"]]
     for run_id, expected_rate in LCB_SPECS.items():
